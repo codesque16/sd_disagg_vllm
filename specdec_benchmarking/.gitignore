@@ -1,0 +1,7 @@
+# Local bench artifacts
+bench_results/
+startup_logs/
+__pycache__/
+*.csv
+*.nsys-rep
+*.sqlite
