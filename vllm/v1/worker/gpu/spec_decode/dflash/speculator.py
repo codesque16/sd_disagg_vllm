@@ -86,6 +86,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+        # Milestone-0: optional NIXL HS transfer to a remote sink (draft stays local).
+        self._hs_nixl_probe = None
+        addr = self.speculative_config.disagg_dflash_address
+        if addr:
+            from vllm.v1.spec_decode.dflash_hs_nixl import DFlashHsNixlProbe
+
+            self._hs_nixl_probe = DFlashHsNixlProbe(
+                addr,
+                max_tokens=self.max_num_tokens,
+                hidden_size=self.hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+            logger.info(
+                "DFlash HS NIXL probe enabled (address=%s); draft remains local",
+                addr,
+            )
+
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
@@ -330,6 +348,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         else:
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+
+        # After HS DtoD, before prepare_dflash: blocking NIXL PtoP to sink.
+        if self._hs_nixl_probe is not None and not dummy_run:
+            self._hs_nixl_probe.transfer(self.hidden_states[:num_target_tokens])
 
         self._copy_request_inputs(
             num_reqs,

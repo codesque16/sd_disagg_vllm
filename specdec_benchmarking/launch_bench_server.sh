@@ -10,6 +10,8 @@
 #       --prefill-port 8100 --decode-port 8200 --batched-tokens 16384
 #   ./launch_bench_server.sh PD4S4_b4096 --print-only
 #   ./launch_bench_server.sh PD1 --devices 0 --port 8000 -- --max-model-len 8192
+#   # Milestone-0 HS NIXL probe (draft still local on GPU0; sink on GPU1):
+#   ./launch_bench_server.sh PD1S1_b8192 --devices 0 --draft-devices 1 --hs-nixl-sink --nsys
 #
 # Case grammar:
 #   PD{tp}[S{draft_tp}][_b{batched}]     colocated prefill+decode
@@ -37,6 +39,8 @@ DRAFT_BIND="${DRAFT_BIND:-tcp://0.0.0.0:50051}"
 DRAFT_ADDR="${DRAFT_ADDR:-tcp://127.0.0.1:50051}"
 DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
 DISAGG_ASYNC=1
+# Milestone-0: colocated PD*S* + NIXL HS sink on --draft-devices (draft stays local).
+HS_NIXL_SINK=0
 # Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
 ENABLE_DISAGG_PROFILE=0
 # Default: synthetic rejection (paper A/B latency). --no-synthetic → real
@@ -113,7 +117,10 @@ Options:
   --prefill-port PORT      Prefill HTTP port (default 8100)
   --decode-port PORT       Decode HTTP port (default 8200)
   --draft-bind ADDR        Draft server bind (default tcp://0.0.0.0:50051)
-  --draft-addr ADDR        Verify→draft connect addr (default tcp://127.0.0.1:50051)
+  --draft-addr ADDR        Verify→draft/sink connect addr (default tcp://127.0.0.1:50051)
+  --hs-nixl-sink           Milestone-0: start HS NIXL sink on --draft-devices and
+                           set speculative_config.disagg_dflash_address=$DRAFT_ADDR
+                           (colocated PD*S* only; draft still runs on verify GPU)
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
   --no-synthetic           real rejection sampling (rejection_sample_method=
                            standard). Default is synthetic rates for paper A/B.
@@ -301,8 +308,15 @@ reject_sample_json_fields() {
 spec_json() {
   local draft_tp="$1"
   # Colocated SD: set draft_tensor_parallel_size.
-  printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s}' \
-    "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)"
+  # Optional Milestone-0 HS NIXL probe via disagg_dflash_address.
+  if [[ "$HS_NIXL_SINK" -eq 1 ]]; then
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s"}' \
+      "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)" \
+      "$DRAFT_ADDR"
+  else
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s}' \
+      "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)"
+  fi
 }
 
 spec_json_sd_disagg() {
@@ -824,6 +838,7 @@ while [[ $# -gt 0 ]]; do
     --decode-port) DECODE_PORT="${2:?}"; shift 2 ;;
     --draft-bind) DRAFT_BIND="${2:?}"; shift 2 ;;
     --draft-addr) DRAFT_ADDR="${2:?}"; shift 2 ;;
+    --hs-nixl-sink) HS_NIXL_SINK=1; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
     --no-synthetic) USE_SYNTHETIC=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
@@ -916,6 +931,32 @@ case "$MODE" in
     DEVICES="${DEVICES:-$(default_devices_for_tp "$TP")}"
     n_dev=$(count_csv "$DEVICES")
     [[ "$n_dev" -eq "$TP" ]] || die "PD${TP} needs ${TP} devices, got '${DEVICES}' (${n_dev})"
+
+    if [[ "$MODE" == colocated_sd && "$HS_NIXL_SINK" -eq 1 ]]; then
+      DRAFT_DEVICES="${DRAFT_DEVICES:-1}"
+      echo "# HS NIXL sink: devices=${DRAFT_DEVICES} bind=${DRAFT_BIND} addr=${DRAFT_ADDR}"
+      sink_cmd=(
+        env
+        HF_HUB_OFFLINE=1
+        "CUDA_VISIBLE_DEVICES=${DRAFT_DEVICES}"
+        python -m vllm.entrypoints.dflash_hs_nixl_sink
+        --bind "$DRAFT_BIND"
+        --device cuda:0
+      )
+      # Do not nsys-wrap the sink with mode=api: that appends vLLM
+      # --profiler-config, which the sink CLI rejects (and then verify hangs
+      # on HELLO). PTOP HS transfer shows on the colocated verify profile.
+      # Optional: wrap sink with mode=session for a full-session sink report.
+      if [[ "$NSYS" -eq 1 ]]; then
+        echo "# nsys: sink left unwrapped (no --profiler-config); see colocated .nsys-rep for PTOP"
+      fi
+      run_cmd "${TAG} hs_nixl_sink devices=${DRAFT_DEVICES}" \
+        "hs_nixl_sink" "${sink_cmd[@]}"
+      # Give ZMQ bind a moment before verify HELLO.
+      if [[ "$PRINT_ONLY" -eq 0 ]]; then
+        sleep 2
+      fi
+    fi
 
     cmd=(
       env

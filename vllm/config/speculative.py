@@ -235,6 +235,14 @@ class SpeculativeConfig:
     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
     Mutually exclusive with synthetic_acceptance_rates."""
 
+    # Milestone-0 HS probe: when set, colocated DFlash also NIXL-WRITEs
+    # hidden states to a sink process at this address (draft stays local).
+    disagg_dflash_address: str | None = None
+    """ZMQ address of the DFlash hidden-state NIXL sink
+    (e.g. ``tcp://127.0.0.1:50051``). When set with method=dflash, each
+    propose() transfers context hiddens via NIXL to that process for
+    profiling; draft still runs on the verify GPU."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -1270,6 +1278,12 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+
+        if self.disagg_dflash_address is not None and self.method != "dflash":
+            raise ValueError(
+                "disagg_dflash_address is only supported with method='dflash'. "
+                f"Got method={self.method!r}."
+            )
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):
