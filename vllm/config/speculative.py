@@ -243,6 +243,12 @@ class SpeculativeConfig:
     propose() transfers context hiddens via NIXL to that process for
     profiling; draft still runs on the verify GPU."""
 
+    disagg_dflash_dual_run_check: bool = False
+    """If True, after receiving remote draft tokens compare them to the local
+    draft (``torch.equal``). Off by default — the compare syncs the GPU and
+    adds milliseconds of latency. Override with env
+    ``VLLM_DFLASH_DUAL_RUN_CHECK=0|1``."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using

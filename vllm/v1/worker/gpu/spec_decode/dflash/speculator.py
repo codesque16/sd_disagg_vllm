@@ -28,6 +28,16 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def _dual_run_check_enabled(speculative_config: Any) -> bool:
+    """Env ``VLLM_DFLASH_DUAL_RUN_CHECK`` overrides speculative_config flag."""
+    import os
+
+    env = os.environ.get("VLLM_DFLASH_DUAL_RUN_CHECK")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(getattr(speculative_config, "disagg_dflash_dual_run_check", False))
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -88,6 +98,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Milestone-0: optional NIXL HS transfer to a remote sink (draft stays local).
         self._hs_nixl_probe = None
+        # Dual-run: remote SPECulate recv is deferred past next execute launch.
+        self._remote_dual_run_deferred = False
+        self._deferred_local_draft: torch.Tensor | None = None
         addr = self.speculative_config.disagg_dflash_address
         if addr:
             from vllm.v1.spec_decode.dflash_hs_nixl import DFlashHsNixlProbe
@@ -100,7 +113,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 device=device,
             )
             logger.info(
-                "DFlash HS NIXL probe enabled (address=%s); draft remains local",
+                "DFlash HS NIXL probe enabled (address=%s); "
+                "local draft still used for serving (dual-run)",
                 addr,
             )
 
@@ -349,9 +363,41 @@ class DFlashSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
-        # After HS DtoD, before prepare_dflash: blocking NIXL PtoP to sink.
+        # After HS DtoD: kick NIXL(+SPECulate) on a side thread — do not wait.
+        # Remote wait is deferred until the *next* propose so the worker can
+        # prepare/launch the next execute_context first (CPU stays free).
         if self._hs_nixl_probe is not None and not dummy_run:
-            self._hs_nixl_probe.transfer(self.hidden_states[:num_target_tokens])
+            # Complete previous step's remote recv (after batch N+1 was prepped).
+            self.finish_remote_dual_run()
+            if not self._hs_nixl_probe._handshook:
+                self._hs_nixl_probe.handshake()
+            if not hasattr(self, "_hs_ready_event"):
+                self._hs_ready_event = torch.cuda.Event()
+            self._hs_ready_event.record()
+            if self._hs_nixl_probe.draft_enabled:
+                self._hs_nixl_probe.begin_speculate(
+                    self.hidden_states[:num_target_tokens],
+                    req_ids=list(input_batch.req_ids[:num_reqs]),
+                    num_speculative_tokens=self.num_speculative_steps,
+                    positions=input_batch.positions,
+                    # Host mirrors — encode path never .cpu() these.
+                    query_start_loc=input_batch.query_start_loc_np,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                    last_sampled=last_sampled,
+                    next_prefill_tokens=next_prefill_tokens,
+                    temperature=temperature,
+                    seeds=seeds,
+                    num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    idx_mapping=input_batch.idx_mapping_np,
+                    src_ready_event=self._hs_ready_event,
+                )
+            else:
+                self._hs_nixl_probe.begin_transfer(
+                    self.hidden_states[:num_target_tokens],
+                    src_ready_event=self._hs_ready_event,
+                )
 
         self._copy_request_inputs(
             num_reqs,
@@ -474,6 +520,97 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+    def defer_remote_dual_run(self, local_draft_tokens: torch.Tensor) -> None:
+        """Mark remote SPECulate in-flight; do not recv yet.
+
+        Serving already has ``local_draft_tokens``. Waiting is deferred to
+        ``finish_remote_dual_run`` at the start of the next propose so the
+        worker can prepare/launch the next batch first.
+        """
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+        if probe._bg_thread is None and not getattr(probe, "_speculate_pending", False):
+            return
+        self._remote_dual_run_deferred = True
+        # Clone only if we will compare later (buffer is reused next step).
+        if _dual_run_check_enabled(self.speculative_config):
+            self._deferred_local_draft = local_draft_tokens.detach().clone()
+        else:
+            self._deferred_local_draft = None
+
+    def finish_remote_dual_run(
+        self, local_draft_tokens: torch.Tensor | None = None
+    ) -> None:
+        """Recv GPU1 draft tokens for a previously deferred dual-run step.
+
+        Called at the start of the next propose (after next execute was able to
+        be prepared/launched). Serving still uses local drafts only.
+
+        This wait is CPU-side (ZMQ recv). A CUDA-stream wait would need NIXL
+        WRITE of tokens into a GPU0 buffer + event signaling instead of ZMQ.
+
+        Token match check is off by default (see
+        ``disagg_dflash_dual_run_check`` / ``VLLM_DFLASH_DUAL_RUN_CHECK``).
+        """
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+        pending = bool(getattr(self, "_remote_dual_run_deferred", False)) or (
+            probe._bg_thread is not None
+            or getattr(probe, "_speculate_pending", False)
+        )
+        if not pending:
+            return
+        local = local_draft_tokens
+        if local is None:
+            local = getattr(self, "_deferred_local_draft", None)
+        torch.cuda.nvtx.range_push("dflash_hs_nixl_remote_wait")
+        try:
+            try:
+                remote = probe.finish_speculate()
+            except Exception:
+                logger.exception("DFlash dual-run finish_speculate failed")
+                return
+            if remote is None:
+                return
+            if local is None:
+                return
+            if tuple(remote.shape) != tuple(local.shape):
+                logger.warning(
+                    "DFlash dual-run shape mismatch: remote=%s local=%s "
+                    "(serving uses local drafts)",
+                    tuple(remote.shape),
+                    tuple(local.shape),
+                )
+                return
+            if not _dual_run_check_enabled(self.speculative_config):
+                return
+            # Expensive: H2D + torch.equal syncs — only when explicitly enabled.
+            remote_gpu = remote.to(device=local.device, dtype=local.dtype)
+            if not torch.equal(remote_gpu, local):
+                n_mismatch = int((remote_gpu != local).any(dim=-1).sum().item())
+                logger.warning(
+                    "DFlash dual-run mismatch: %d/%d reqs differ "
+                    "(serving uses local drafts)",
+                    n_mismatch,
+                    local.shape[0],
+                )
+        finally:
+            self._remote_dual_run_deferred = False
+            self._deferred_local_draft = None
+            torch.cuda.nvtx.range_pop()
+
+    def remote_cuda_profile(self, start: bool) -> None:
+        """Mirror verify cudaProfilerStart/Stop onto the HS NIXL sink GPU."""
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+        try:
+            probe.profile(start)
+        except Exception as e:
+            logger.warning("DFlash HS NIXL remote PROFILE failed: %s", e)
 
 
 @triton.jit

@@ -772,6 +772,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        # Dual-run remote draft: free draft-side KV for finished/preempted reqs.
+        probe = getattr(getattr(self, "speculator", None), "_hs_nixl_probe", None)
+        if probe is not None and finished_req_ids:
+            try:
+                # FREE drains any in-flight SPECulate on the socket.
+                probe.free(list(finished_req_ids))
+            except Exception:
+                logger.exception("DFlash HS NIXL FREE failed")
+            else:
+                # Keep deferred dual-run bookkeeping in sync with the drain.
+                spec = getattr(self, "speculator", None)
+                if spec is not None:
+                    spec._remote_dual_run_deferred = False
+                    spec._deferred_local_draft = None
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -1518,9 +1532,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
+            # Local draft-token memcpy (serving path) — do not block on GPU1 here.
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
-        if self.num_speculative_steps > 0:
+            # Dual-run: defer ZMQ recv until the *next* propose so this worker
+            # can prepare/launch the next execute_context first.
+            if hasattr(self.speculator, "defer_remote_dual_run"):
+                self.speculator.defer_remote_dual_run(draft_tokens)
+
+            if self.num_speculative_steps > 0:
+                # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+                # not have a speculator (i.e. self.speculator is None)
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                )
+
+        elif self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(

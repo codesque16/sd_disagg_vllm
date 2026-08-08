@@ -41,6 +41,7 @@ DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
 DISAGG_ASYNC=1
 # Milestone-0: colocated PD*S* + NIXL HS sink on --draft-devices (draft stays local).
 HS_NIXL_SINK=0
+DUAL_RUN_CHECK=0
 # Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
 ENABLE_DISAGG_PROFILE=0
 # Default: synthetic rejection (paper A/B latency). --no-synthetic → real
@@ -121,6 +122,8 @@ Options:
   --hs-nixl-sink           Milestone-0: start HS NIXL sink on --draft-devices and
                            set speculative_config.disagg_dflash_address=$DRAFT_ADDR
                            (colocated PD*S* only; draft still runs on verify GPU)
+  --dual-run-check         With --hs-nixl-sink: compare remote vs local draft tokens
+                           (disagg_dflash_dual_run_check=true; adds GPU sync)
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
   --no-synthetic           real rejection sampling (rejection_sample_method=
                            standard). Default is synthetic rates for paper A/B.
@@ -138,15 +141,15 @@ Options:
                            All modes use cudaProfilerApi capture range —
                            pair with benchmark_random.sh --nsys so the bench
                            window calls /start_profile…/stop_profile.
-                           PV*S*: one combined report (draft+verify timeline);
-                           draft mirrors verify cudaProfilerStart/Stop over ZMQ.
+                           PV*S* and PD*S*+--hs-nixl-sink: one combined report
+                           (draft/sink + verify on both GPUs);
                            (bench_results/<tag>/nsys/<tag>_combined_<ts>.nsys-rep).
   --nsys-dir DIR           override nsys output dir
                            (default: <script>/bench_results/<tag>/nsys)
   --nsys-delay SEC         Legacy timed-capture roles only (default 90).
-                           PV*S* combined uses cudaProfilerApi like PD.
+                           Combined modes use cudaProfilerApi like PD.
   --nsys-duration SEC      Legacy timed-capture roles only (default 30; 0=until exit).
-                           PV*S* combined uses cudaProfilerApi like PD.
+                           Combined modes use cudaProfilerApi like PD.
   --nsys-gpu-metrics       Add --gpu-metrics-devices=all (needs nvidia counter
                            privileges; off by default — ERR_NVGPUCTRPERM)
   --nsys-no-nvtx           Do not set VLLM_NVTX_SCOPES_FOR_PROFILING=1
@@ -310,9 +313,11 @@ spec_json() {
   # Colocated SD: set draft_tensor_parallel_size.
   # Optional Milestone-0 HS NIXL probe via disagg_dflash_address.
   if [[ "$HS_NIXL_SINK" -eq 1 ]]; then
-    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s"}' \
+    local dual_check="false"
+    [[ "${DUAL_RUN_CHECK:-0}" -eq 1 ]] && dual_check="true"
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_dual_run_check":%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)" \
-      "$DRAFT_ADDR"
+      "$DRAFT_ADDR" "$dual_check"
   else
     printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)"
@@ -396,6 +401,29 @@ wait_http_ready() {
     now=$(date +%s)
     if [[ $((now - start)) -ge "$timeout_s" ]]; then
       die "${name} not ready after ${timeout_s}s (last HTTP ${code:-000}) -- check its log"
+    fi
+    sleep 2
+  done
+}
+
+# Wait until the newest log for role contains a ready needle (draft load).
+wait_log_ready() {
+  local role="$1"
+  local needle="$2"
+  local name="$3"
+  local timeout_s="${4:-${PROXY_WAIT_TIMEOUT:-600}}"
+  local start now logfile
+  start=$(date +%s)
+  echo "# waiting for ${name} log needle '${needle}' (timeout ${timeout_s}s)..."
+  while true; do
+    logfile=$(ls -t "${LOG_DIR}/${TAG}_${role}_"*.log 2>/dev/null | head -1 || true)
+    if [[ -n "$logfile" ]] && grep -q "$needle" "$logfile" 2>/dev/null; then
+      echo "# ${name} ready (log=${logfile})"
+      return 0
+    fi
+    now=$(date +%s)
+    if [[ $((now - start)) -ge "$timeout_s" ]]; then
+      die "${name} not ready after ${timeout_s}s -- check ${logfile:-${LOG_DIR}/${TAG}_${role}_*.log}"
     fi
     sleep 2
   done
@@ -623,9 +651,11 @@ nsys_write_run_script() {
 
 nsys_build_combined_helper() {
   # Args: draft_log verify_log helper_path draft_run_script verify_run_script
+  # Optional $6: grep needle in draft_log before starting verify (e.g. sink listening).
   # Used for both --nsys (under nsys profile) and plain PV*S* launches so
   # Ctrl+C always tears down draft + verify process groups.
   local draft_log="$1" verify_log="$2" helper="$3" draft_run="$4" verify_run="$5"
+  local ready_needle="${6:-}"
   cat >"$helper" <<EOF
 #!/usr/bin/env bash
 # Auto-generated by launch_bench_server.sh — start draft then verify.
@@ -637,6 +667,7 @@ draft_log=$(printf '%q' "$draft_log")
 verify_log=$(printf '%q' "$verify_log")
 draft_run=$(printf '%q' "$draft_run")
 verify_run=$(printf '%q' "$verify_run")
+ready_needle=$(printf '%q' "$ready_needle")
 
 draft_pid=""
 verify_pid=""
@@ -691,7 +722,20 @@ start_role() {
 start_role "\$draft_run" "\$draft_log"
 draft_pid=\$_role_pid
 echo "# draft pid=\$draft_pid"
-sleep 2
+if [[ -n "\$ready_needle" ]]; then
+  echo "# waiting for draft ready needle: \$ready_needle"
+  _t0=\$(date +%s)
+  while ! grep -q "\$ready_needle" "\$draft_log" 2>/dev/null; do
+    if [[ \$(( \$(date +%s) - _t0 )) -ge 600 ]]; then
+      echo "# ERROR: draft not ready after 600s (needle=\$ready_needle)" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "# draft ready"
+else
+  sleep 2
+fi
 start_role "\$verify_run" "\$verify_log"
 verify_pid=\$_role_pid
 echo "# verify pid=\$verify_pid"
@@ -702,8 +746,10 @@ EOF
 
 # Build combined nsys profile argv into nameref $1 (draft_cmd/verify_cmd already set).
 # Mutates draft_cmd/verify_cmd via nsys_finalize_app_cmd; sets NSYS_COMBINED_OUT.
+# Optional $2: draft-log ready needle before starting verify.
 nsys_prepare_combined_profile_cmd() {
   local -n _out_cmd="$1"
+  local ready_needle="${2:-}"
   nsys_require_bin
   mkdir -p "$NSYS_DIR" "$LOG_DIR"
   NSYS_COMBINED_OUT="${NSYS_DIR}/${TAG}_combined_${NSYS_RUN_TS}"
@@ -721,7 +767,8 @@ nsys_prepare_combined_profile_cmd() {
 
   nsys_write_run_script "$draft_run" draft_cmd
   nsys_write_run_script "$verify_run" verify_cmd
-  nsys_build_combined_helper "$draft_log" "$verify_log" "$helper" "$draft_run" "$verify_run"
+  nsys_build_combined_helper "$draft_log" "$verify_log" "$helper" "$draft_run" "$verify_run" \
+    "$ready_needle"
 
   local bash_bin
   bash_bin="$(nsys_resolve_exe bash || true)"
@@ -729,7 +776,8 @@ nsys_prepare_combined_profile_cmd() {
 
   # --wait=primary: do not hang on re-parented EngineCore/draft children.
   # cudaProfilerApi: only the bench window (benchmark_random.sh --nsys →
-  # /start_profile…/stop_profile). Draft mirrors via ZMQ PROFILE.
+  # /start_profile…/stop_profile). Verify mirrors PROFILE over ZMQ so the
+  # sink also calls cuda.profiler.start/stop (else GPU1 shows PtoP only).
   _out_cmd=(
     "$NSYS_BIN" profile
     -o "$NSYS_COMBINED_OUT"
@@ -839,6 +887,7 @@ while [[ $# -gt 0 ]]; do
     --draft-bind) DRAFT_BIND="${2:?}"; shift 2 ;;
     --draft-addr) DRAFT_ADDR="${2:?}"; shift 2 ;;
     --hs-nixl-sink) HS_NIXL_SINK=1; shift ;;
+    --dual-run-check) DUAL_RUN_CHECK=1; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
     --no-synthetic) USE_SYNTHETIC=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
@@ -907,6 +956,9 @@ if [[ "$NSYS" -eq 1 ]]; then
   if [[ "$MODE" == sd_disagg ]]; then
     echo "# nsys PV*S*: combined cudaProfilerApi → ${TAG}_combined_${NSYS_RUN_TS}.nsys-rep"
     echo "# pair with: ./benchmark_random.sh --tag ${TAG} --nsys ..."
+  elif [[ "$MODE" == colocated_sd && "$HS_NIXL_SINK" -eq 1 ]]; then
+    echo "# nsys PD*S*+hs-nixl-sink: combined → ${TAG}_combined_${NSYS_RUN_TS}.nsys-rep"
+    echo "# pair with: ./benchmark_random.sh --tag ${TAG} --nsys ..."
   else
     echo "# nsys draft_delay=${NSYS_DELAY}s  draft_duration=${NSYS_DURATION}s"
     echo "# pair with: ./benchmark_random.sh --tag ${TAG} --nsys ..."
@@ -932,6 +984,7 @@ case "$MODE" in
     n_dev=$(count_csv "$DEVICES")
     [[ "$n_dev" -eq "$TP" ]] || die "PD${TP} needs ${TP} devices, got '${DEVICES}' (${n_dev})"
 
+    sink_cmd=()
     if [[ "$MODE" == colocated_sd && "$HS_NIXL_SINK" -eq 1 ]]; then
       DRAFT_DEVICES="${DRAFT_DEVICES:-1}"
       echo "# HS NIXL sink: devices=${DRAFT_DEVICES} bind=${DRAFT_BIND} addr=${DRAFT_ADDR}"
@@ -942,20 +995,15 @@ case "$MODE" in
         python -m vllm.entrypoints.dflash_hs_nixl_sink
         --bind "$DRAFT_BIND"
         --device cuda:0
+        --draft-model "$DRAFT_MODEL"
+        --target-model "$MODEL"
+        --num-speculative-tokens "$NUM_SPEC_TOKENS"
+        --max-model-len "$MAX_MODEL_LEN"
+        --max-num-seqs "$MAX_NUM_SEQS"
+        --max-num-batched-tokens "$BATCHED"
+        --gpu-memory-utilization "$GPU_MEM_UTIL"
+        --block-size "$BLOCK_SIZE"
       )
-      # Do not nsys-wrap the sink with mode=api: that appends vLLM
-      # --profiler-config, which the sink CLI rejects (and then verify hangs
-      # on HELLO). PTOP HS transfer shows on the colocated verify profile.
-      # Optional: wrap sink with mode=session for a full-session sink report.
-      if [[ "$NSYS" -eq 1 ]]; then
-        echo "# nsys: sink left unwrapped (no --profiler-config); see colocated .nsys-rep for PTOP"
-      fi
-      run_cmd "${TAG} hs_nixl_sink devices=${DRAFT_DEVICES}" \
-        "hs_nixl_sink" "${sink_cmd[@]}"
-      # Give ZMQ bind a moment before verify HELLO.
-      if [[ "$PRINT_ONLY" -eq 0 ]]; then
-        sleep 2
-      fi
     fi
 
     cmd=(
@@ -971,11 +1019,56 @@ case "$MODE" in
     if [[ "$MODE" == colocated_sd ]]; then
       cmd+=(--speculative-config "$(spec_json "$DRAFT_TP")")
     fi
-    maybe_wrap_nsys cmd colocated api
-    run_cmd "${TAG} colocated tp=${TP} devices=${DEVICES} port=${PORT}" \
-      "colocated" "${cmd[@]}"
-    if [[ "$PRINT_ONLY" -eq 0 ]]; then
-      wait
+
+    # PD*S* + --hs-nixl-sink + --nsys: one combined .nsys-rep (GPU0+GPU1), like PV*S*.
+    if [[ "$NSYS" -eq 1 && ${#sink_cmd[@]} -gt 0 ]]; then
+      draft_cmd=("${sink_cmd[@]}")
+      verify_cmd=("${cmd[@]}")
+      combined_cmd=()
+      nsys_prepare_combined_profile_cmd combined_cmd "DFlash HS NIXL sink listening"
+      combined_log="${LOG_DIR}/${TAG}_combined_${NSYS_RUN_TS}.log"
+      echo
+      echo "# ---- ${TAG} COMBINED nsys sink=${DRAFT_DEVICES} verify=${DEVICES} port=${PORT} ----"
+      echo "# log -> ${combined_log}"
+      shell_join "${combined_cmd[@]}"
+      echo
+      echo "# nsys combined: ${NSYS_COMBINED_OUT}.nsys-rep  (GPU0 verify + GPU1 sink)"
+      echo "# run: ./benchmark_random.sh --tag ${TAG} --nsys ...  (required for capture)"
+      echo "# then Ctrl+C here to finalize the .nsys-rep"
+      if [[ "$PRINT_ONLY" -eq 1 ]]; then
+        :
+      else
+        mkdir -p "$LOG_DIR" "$NSYS_DIR"
+        {
+          echo "# launched: $(date -Is)"
+          echo "# tag=${TAG} role=combined"
+          echo "# cmd: $(shell_join "${combined_cmd[@]}")"
+          echo "# ----"
+        } >"$combined_log"
+        echo "# tip: one Ctrl+C after the bench — wait for nsys to print Generating..."
+        set +e
+        if command -v stdbuf >/dev/null 2>&1; then
+          stdbuf -oL -eL "${combined_cmd[@]}" > >(tee -a "$combined_log") 2>&1
+        else
+          "${combined_cmd[@]}" > >(tee -a "$combined_log") 2>&1
+        fi
+        set -e
+        echo "# nsys combined report: ${NSYS_COMBINED_OUT}.nsys-rep"
+      fi
+    else
+      if [[ ${#sink_cmd[@]} -gt 0 ]]; then
+        run_cmd "${TAG} hs_nixl_sink devices=${DRAFT_DEVICES}" \
+          "hs_nixl_sink" "${sink_cmd[@]}"
+        if [[ "$PRINT_ONLY" -eq 0 ]]; then
+          wait_log_ready "hs_nixl_sink" "DFlash HS NIXL sink listening" "hs_nixl_sink"
+        fi
+      fi
+      maybe_wrap_nsys cmd colocated api
+      run_cmd "${TAG} colocated tp=${TP} devices=${DEVICES} port=${PORT}" \
+        "colocated" "${cmd[@]}"
+      if [[ "$PRINT_ONLY" -eq 0 ]]; then
+        wait
+      fi
     fi
     ;;
 

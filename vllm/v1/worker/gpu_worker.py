@@ -1224,11 +1224,23 @@ class Worker(WorkerBase):
             # If profiler already initialized, restart profiling but keep
             # the original trace name from the first initialization.
             self.profiler.start()
+            self._maybe_remote_hs_nixl_cuda_profile(is_start=True)
         else:
             if self.profiler is None:
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
             self.profiler.stop()
+            self._maybe_remote_hs_nixl_cuda_profile(is_start=False)
+
+    def _maybe_remote_hs_nixl_cuda_profile(self, *, is_start: bool) -> None:
+        """Keep sink GPU inside the same nsys cudaProfilerApi window as verify."""
+        try:
+            speculator = getattr(self.model_runner, "speculator", None)
+            remote = getattr(speculator, "remote_cuda_profile", None)
+            if callable(remote):
+                remote(is_start)
+        except Exception as e:
+            logger.warning("DFlash HS NIXL remote cuda profile notify failed: %s", e)
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
