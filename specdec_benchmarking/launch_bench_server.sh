@@ -10,7 +10,7 @@
 #       --prefill-port 8100 --decode-port 8200 --batched-tokens 16384
 #   ./launch_bench_server.sh PD4S4_b4096 --print-only
 #   ./launch_bench_server.sh PD1 --devices 0 --port 8000 -- --max-model-len 8192
-#   # Milestone-0 HS NIXL probe (draft still local on GPU0; sink on GPU1):
+#   # Milestone-2 HS NIXL remote-only draft (verify GPU0; sink draft on GPU1):
 #   ./launch_bench_server.sh PD1S1_b8192 --devices 0 --draft-devices 1 --hs-nixl-sink --nsys
 #
 # Case grammar:
@@ -39,9 +39,11 @@ DRAFT_BIND="${DRAFT_BIND:-tcp://0.0.0.0:50051}"
 DRAFT_ADDR="${DRAFT_ADDR:-tcp://127.0.0.1:50051}"
 DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
 DISAGG_ASYNC=1
-# Milestone-0: colocated PD*S* + NIXL HS sink on --draft-devices (draft stays local).
+# Milestone-2: colocated PD*S* + NIXL HS sink on --draft-devices (remote-only draft).
 HS_NIXL_SINK=0
+# Legacy Milestone-1 dual-run compare (requires remote_only=false; unused by default).
 DUAL_RUN_CHECK=0
+REMOTE_ONLY=1
 # Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
 ENABLE_DISAGG_PROFILE=0
 # Default: synthetic rejection (paper A/B latency). --no-synthetic → real
@@ -119,11 +121,14 @@ Options:
   --decode-port PORT       Decode HTTP port (default 8200)
   --draft-bind ADDR        Draft server bind (default tcp://0.0.0.0:50051)
   --draft-addr ADDR        Verify→draft/sink connect addr (default tcp://127.0.0.1:50051)
-  --hs-nixl-sink           Milestone-0: start HS NIXL sink on --draft-devices and
+  --hs-nixl-sink           Milestone-2: start HS NIXL sink on --draft-devices and
                            set speculative_config.disagg_dflash_address=$DRAFT_ADDR
-                           (colocated PD*S* only; draft still runs on verify GPU)
-  --dual-run-check         With --hs-nixl-sink: compare remote vs local draft tokens
-                           (disagg_dflash_dual_run_check=true; adds GPU sync)
+                           + disagg_dflash_remote_only=true (colocated PD*S* only;
+                           verify skips local draft; serves sink draft tokens)
+  --no-remote-only         With --hs-nixl-sink: Milestone-1 dual-run (local draft
+                           still serves; remote draft for compare/profiling only)
+  --dual-run-check         With --hs-nixl-sink --no-remote-only: compare remote vs
+                           local draft tokens (adds GPU sync)
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
   --no-synthetic           real rejection sampling (rejection_sample_method=
                            standard). Default is synthetic rates for paper A/B.
@@ -311,13 +316,19 @@ reject_sample_json_fields() {
 spec_json() {
   local draft_tp="$1"
   # Colocated SD: set draft_tensor_parallel_size.
-  # Optional Milestone-0 HS NIXL probe via disagg_dflash_address.
+  # Optional Milestone-2 HS NIXL remote-only (or M1 dual-run via --no-remote-only).
   if [[ "$HS_NIXL_SINK" -eq 1 ]]; then
     local dual_check="false"
+    local remote_only="true"
     [[ "${DUAL_RUN_CHECK:-0}" -eq 1 ]] && dual_check="true"
-    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_dual_run_check":%s}' \
+    [[ "${REMOTE_ONLY:-1}" -eq 1 ]] || remote_only="false"
+    # dual-run check only meaningful when local draft still runs.
+    if [[ "$remote_only" == "true" ]]; then
+      dual_check="false"
+    fi
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_remote_only":%s,"disagg_dflash_dual_run_check":%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)" \
-      "$DRAFT_ADDR" "$dual_check"
+      "$DRAFT_ADDR" "$remote_only" "$dual_check"
   else
     printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)"
@@ -887,6 +898,7 @@ while [[ $# -gt 0 ]]; do
     --draft-bind) DRAFT_BIND="${2:?}"; shift 2 ;;
     --draft-addr) DRAFT_ADDR="${2:?}"; shift 2 ;;
     --hs-nixl-sink) HS_NIXL_SINK=1; shift ;;
+    --no-remote-only) REMOTE_ONLY=0; shift ;;
     --dual-run-check) DUAL_RUN_CHECK=1; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
     --no-synthetic) USE_SYNTHETIC=0; shift ;;

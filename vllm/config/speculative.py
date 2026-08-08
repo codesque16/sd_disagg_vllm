@@ -236,17 +236,26 @@ class SpeculativeConfig:
     Mutually exclusive with synthetic_acceptance_rates."""
 
     # Milestone-0 HS probe: when set, colocated DFlash also NIXL-WRITEs
-    # hidden states to a sink process at this address (draft stays local).
+    # hidden states to a sink process at this address.
     disagg_dflash_address: str | None = None
     """ZMQ address of the DFlash hidden-state NIXL sink
     (e.g. ``tcp://127.0.0.1:50051``). When set with method=dflash, each
-    propose() transfers context hiddens via NIXL to that process for
-    profiling; draft still runs on the verify GPU."""
+    propose() transfers context hiddens via NIXL to that process.
+    With ``disagg_dflash_remote_only=False`` (Milestone-1 dual-run), draft
+    still runs on the verify GPU. With ``disagg_dflash_remote_only=True``
+    (Milestone-2), verify skips local draft kernels and serves remote tokens."""
+
+    disagg_dflash_remote_only: bool = False
+    """If True (with ``disagg_dflash_address``), verify does not load full
+    DFlash weights / draft KV and does not run local draft forward. It keeps
+    only the aux-HS ``fc`` projector (C1), kicks SPECulate to the sink, blocks
+    on ZMQ draft tokens, and uses those for serving."""
 
     disagg_dflash_dual_run_check: bool = False
-    """If True, after receiving remote draft tokens compare them to the local
-    draft (``torch.equal``). Off by default — the compare syncs the GPU and
-    adds milliseconds of latency. Override with env
+    """If True (dual-run only), after receiving remote draft tokens compare
+    them to the local draft (``torch.equal``). Off by default — the compare
+    syncs the GPU and adds milliseconds of latency. Ignored when
+    ``disagg_dflash_remote_only`` is True. Override with env
     ``VLLM_DFLASH_DUAL_RUN_CHECK=0|1``."""
 
     @staticmethod
@@ -1289,6 +1298,11 @@ class SpeculativeConfig:
             raise ValueError(
                 "disagg_dflash_address is only supported with method='dflash'. "
                 f"Got method={self.method!r}."
+            )
+        if self.disagg_dflash_remote_only and self.disagg_dflash_address is None:
+            raise ValueError(
+                "disagg_dflash_remote_only requires disagg_dflash_address "
+                "(HS NIXL sink with draft enabled)."
             )
         return self
 

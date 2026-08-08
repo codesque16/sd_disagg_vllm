@@ -20,7 +20,10 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+    load_dflash_fc_only,
+    load_dflash_model,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
@@ -96,9 +99,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
-        # Milestone-0: optional NIXL HS transfer to a remote sink (draft stays local).
+        # Milestone-2: verify serves remote draft tokens; local draft skipped.
+        self.remote_only = bool(
+            getattr(self.speculative_config, "disagg_dflash_remote_only", False)
+        )
+
+        # Milestone-0/1: optional NIXL HS (+ optional dual-run remote draft).
         self._hs_nixl_probe = None
-        # Dual-run: remote SPECulate recv is deferred past next execute launch.
+        # Dual-run only: remote SPECulate recv deferred past next execute launch.
         self._remote_dual_run_deferred = False
         self._deferred_local_draft: torch.Tensor | None = None
         addr = self.speculative_config.disagg_dflash_address
@@ -112,11 +120,18 @@ class DFlashSpeculator(DraftModelSpeculator):
                 dtype=self.dtype,
                 device=device,
             )
-            logger.info(
-                "DFlash HS NIXL probe enabled (address=%s); "
-                "local draft still used for serving (dual-run)",
-                addr,
-            )
+            if self.remote_only:
+                logger.info(
+                    "DFlash HS NIXL probe enabled (address=%s); "
+                    "remote-only serving (no local draft forward)",
+                    addr,
+                )
+            else:
+                logger.info(
+                    "DFlash HS NIXL probe enabled (address=%s); "
+                    "local draft still used for serving (dual-run)",
+                    addr,
+                )
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -130,6 +145,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.remote_only:
+            # Draft kernels / graphs live on the sink GPU.
+            self.query_cudagraph_manager = None
+            return
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
@@ -156,6 +175,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        if self.remote_only:
+            logger.info(
+                "Skipping %s CUDA graph capture on verify (remote-only draft).",
+                self._speculator_name,
+            )
+            return
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to zero to prevent stale values from prior
         # dummy runs from being baked into the captured graph.
@@ -179,6 +204,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
+        if self.remote_only:
+            return load_dflash_fc_only(self.vllm_config, self.device)
         return load_dflash_model(target_model, self.vllm_config)
 
     def set_attn(
@@ -189,6 +216,22 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
+        if self.remote_only:
+            # fc-only stub has no draft attention / KV on the verify GPU.
+            self.model_state = model_state
+            self.kv_cache_config = kv_cache_config
+            self.block_tables = block_tables
+            self.target_input_buffers = target_input_buffers
+            self.target_attn_groups = target_attn_groups
+            self.attn_groups = []
+            self.draft_attn_layer_names = set()
+            self.draft_kv_cache_group_ids = []
+            self.draft_kv_cache_group_id = -1
+            self._context_slot_mappings = None
+            self._layer_group_idx = None
+            self._group_causal = not self.requires_non_causal
+            return
+
         super().set_attn(
             model_state,
             kv_cache_config,
@@ -363,9 +406,27 @@ class DFlashSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
+        # Milestone-2 remote-only: kick SPECulate, block for draft tokens, skip
+        # local prepare/forward/sample (draft lives on the sink GPU).
+        if self.remote_only:
+            if dummy_run:
+                # Memory/cudagraph warmup: no sink round-trip; no local draft.
+                return self.draft_tokens[:num_reqs]
+            return self._propose_remote_only(
+                input_batch=input_batch,
+                num_reqs=num_reqs,
+                num_target_tokens=num_target_tokens,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                temperature=temperature,
+                seeds=seeds,
+            )
+
         # After HS DtoD: kick NIXL(+SPECulate) on a side thread — do not wait.
-        # Remote wait is deferred until the *next* propose so the worker can
-        # prepare/launch the next execute_context first (CPU stays free).
+        # Dual-run: remote wait is deferred until the *next* propose so the
+        # worker can prepare/launch the next execute_context first.
         if self._hs_nixl_probe is not None and not dummy_run:
             # Complete previous step's remote recv (after batch N+1 was prepped).
             self.finish_remote_dual_run()
@@ -521,13 +582,84 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         return self.draft_tokens[:num_reqs]
 
+    def _propose_remote_only(
+        self,
+        *,
+        input_batch: InputBatch,
+        num_reqs: int,
+        num_target_tokens: int,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> torch.Tensor:
+        """Kick sink SPECulate and block until draft tokens return over ZMQ."""
+        probe = self._hs_nixl_probe
+        if probe is None:
+            raise RuntimeError(
+                "disagg_dflash_remote_only requires disagg_dflash_address "
+                "(HS NIXL probe was not created)."
+            )
+        if not probe._handshook:
+            probe.handshake()
+        if not probe.draft_enabled:
+            raise RuntimeError(
+                "disagg_dflash_remote_only requires a sink with draft enabled "
+                "(start dflash_hs_nixl_sink with --draft-model)."
+            )
+
+        if not hasattr(self, "_hs_ready_event"):
+            self._hs_ready_event = torch.cuda.Event()
+        self._hs_ready_event.record()
+        probe.begin_speculate(
+            self.hidden_states[:num_target_tokens],
+            req_ids=list(input_batch.req_ids[:num_reqs]),
+            num_speculative_tokens=self.num_speculative_steps,
+            positions=input_batch.positions,
+            query_start_loc=input_batch.query_start_loc_np,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            temperature=temperature,
+            seeds=seeds,
+            num_scheduled_tokens=input_batch.num_scheduled_tokens,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            idx_mapping=input_batch.idx_mapping_np,
+            src_ready_event=self._hs_ready_event,
+        )
+
+        # CPU wait while GPU0 is idle — expected nsys hole until GPU1 finishes.
+        torch.cuda.nvtx.range_push("dflash_hs_nixl_remote_wait")
+        try:
+            remote = probe.finish_speculate()
+        finally:
+            torch.cuda.nvtx.range_pop()
+        if remote is None:
+            raise RuntimeError("DFlash remote-only: SPECulate reply missing draft tokens")
+        if remote.shape[0] != num_reqs or remote.shape[-1] != self.num_speculative_steps:
+            raise RuntimeError(
+                "DFlash remote-only: unexpected draft_tokens shape "
+                f"{tuple(remote.shape)} (expected ({num_reqs}, "
+                f"{self.num_speculative_steps}))"
+            )
+        remote_gpu = remote.to(
+            device=self.draft_tokens.device, dtype=self.draft_tokens.dtype
+        )
+        self.draft_tokens[:num_reqs].copy_(remote_gpu)
+        return self.draft_tokens[:num_reqs]
+
     def defer_remote_dual_run(self, local_draft_tokens: torch.Tensor) -> None:
-        """Mark remote SPECulate in-flight; do not recv yet.
+        """Mark remote SPECulate in-flight; do not recv yet (dual-run only).
 
         Serving already has ``local_draft_tokens``. Waiting is deferred to
         ``finish_remote_dual_run`` at the start of the next propose so the
         worker can prepare/launch the next batch first.
         """
+        if self.remote_only:
+            return
         probe = self._hs_nixl_probe
         if probe is None:
             return
@@ -554,6 +686,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         Token match check is off by default (see
         ``disagg_dflash_dual_run_check`` / ``VLLM_DFLASH_DUAL_RUN_CHECK``).
         """
+        if self.remote_only:
+            return
         probe = self._hs_nixl_probe
         if probe is None:
             return

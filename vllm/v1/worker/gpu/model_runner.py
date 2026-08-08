@@ -310,7 +310,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not load_dummy_weights:
             prepare_communication_buffer_for_model(self.model)
-            if self.speculator is not None:
+            if self.speculator is not None and not getattr(
+                self.speculator, "remote_only", False
+            ):
+                # Remote-only verify keeps an fc-only stub (no draft TP layers).
                 prepare_communication_buffer_for_model(self.speculator.model)
 
         # Initialize the components that require the model.

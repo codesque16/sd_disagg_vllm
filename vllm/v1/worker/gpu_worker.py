@@ -84,7 +84,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import warmup_kernels, warmup_uniform_decode_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -861,6 +861,10 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            # Target-only uniform-decode sweep so MoE/routing Triton specializations
+            # for decode batch sizes compile before jit_monitor activates. Does not
+            # wait on a remote draft sink (dummy_run propose path).
+            warmup_uniform_decode_kernels(self.model_runner)
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory

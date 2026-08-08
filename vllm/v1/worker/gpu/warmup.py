@@ -11,7 +11,7 @@ import torch
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -23,6 +23,77 @@ from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _uniform_decode_warmup_sizes(model_runner: GPUModelRunner) -> list[int]:
+    """Token counts for target-only uniform-decode warmup.
+
+    Sweeps cudagraph capture sizes (rounded to decode_query_len) plus
+    power-of-two request counts up to max decode concurrency. Each size is a
+    multiple of decode_query_len so `_dummy_run(..., uniform_decode=True)` is
+    valid.
+    """
+    decode_query_len = model_runner.decode_query_len
+    if decode_query_len <= 0:
+        return []
+
+    max_num_reqs = model_runner.max_num_reqs
+    max_tokens = min(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        max_num_reqs * decode_query_len,
+    )
+    max_tokens = (max_tokens // decode_query_len) * decode_query_len
+    if max_tokens < decode_query_len:
+        return []
+
+    sizes: set[int] = {decode_query_len, max_tokens}
+
+    num_reqs = 1
+    while num_reqs <= max_num_reqs:
+        num_tokens = num_reqs * decode_query_len
+        if num_tokens <= max_tokens:
+            sizes.add(num_tokens)
+        num_reqs *= 2
+
+    cg_sizes = model_runner.vllm_config.compilation_config.cudagraph_capture_sizes
+    if cg_sizes:
+        for size in cg_sizes:
+            rounded = round_up(size, decode_query_len)
+            if decode_query_len <= rounded <= max_tokens:
+                sizes.add(rounded)
+
+    return sorted(sizes, reverse=True)
+
+
+@torch.inference_mode()
+def warmup_uniform_decode_kernels(model_runner: GPUModelRunner) -> None:
+    """JIT target-side Triton kernels for uniform decode batch sizes.
+
+    Uses `_dummy_run(..., uniform_decode=True)` so only the verify/target
+    forward is exercised (speculator propose runs with dummy_run=True and does
+    not wait on a remote draft sink).
+    """
+    if model_runner.is_pooling_model:
+        return
+
+    sizes = _uniform_decode_warmup_sizes(model_runner)
+    if not sizes:
+        return
+
+    logger.info(
+        "Warming up %d uniform-decode target sizes for Triton JIT "
+        "(decode_query_len=%d, max=%d).",
+        len(sizes),
+        model_runner.decode_query_len,
+        sizes[0],
+    )
+    for num_tokens in sizes:
+        model_runner._dummy_run(
+            num_tokens,
+            uniform_decode=True,
+            skip_eplb=True,
+        )
+    torch.accelerator.synchronize()
 
 
 def run_mixed_prefill_decode_warmup(
