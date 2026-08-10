@@ -108,6 +108,12 @@ class DFlashHsNixlProbe:
         self._reply_lock = threading.Lock()
         # True after bg (or callback path) finished the SPECulate reply.
         self._reply_complete = False
+        # Host signal: source HS buffer is safe to overwrite. Cleared when a
+        # kick/transfer borrows the caller's tensor; set after staging into
+        # `_local_buf` (not after remote SPECulate recv). Init set so the first
+        # propose never blocks.
+        self._hs_src_released = threading.Event()
+        self._hs_src_released.set()
 
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.DEALER)
@@ -580,6 +586,8 @@ class DFlashHsNixlProbe:
             self._bg_reply = None
             self._reply_complete = False
 
+        # Borrow caller's HS until staging copies it into `_local_buf`.
+        self._hs_src_released.clear()
         hs = hidden_states
         n_ctx = int(hs.shape[0])
         num_reqs = len(req_ids)
@@ -761,6 +769,8 @@ class DFlashHsNixlProbe:
                         )
                     finally:
                         torch.cuda.nvtx.range_pop()
+                        # Source HS may be overwritten once staged into local buf.
+                        self._hs_src_released.set()
 
                     if nbytes > 0:
                         self._nixl_write_nbytes(nbytes)
@@ -796,6 +806,8 @@ class DFlashHsNixlProbe:
                             reply_cb(remote)
             except BaseException as e:
                 self._bg_error = e
+                # Never leave waiters hung if we fail before/during staging.
+                self._hs_src_released.set()
                 if sent_speculate:
                     try:
                         self._sock.send_multipart(
@@ -817,6 +829,20 @@ class DFlashHsNixlProbe:
         )
         self._bg_thread.start()
 
+    def wait_hs_src_released(self) -> None:
+        """Block until the prior kick/transfer finished staging from source HS.
+
+        Does not join the bg thread or wait for SPECulate recv — only until the
+        caller's HS buffer is safe to overwrite.
+        """
+        if self._hs_src_released.is_set():
+            return
+        torch.cuda.nvtx.range_push("dflash_hs_nixl_hs_src_wait")
+        try:
+            self._hs_src_released.wait()
+        finally:
+            torch.cuda.nvtx.range_pop()
+
     def begin_transfer(
         self,
         hidden_states: torch.Tensor,
@@ -830,6 +856,7 @@ class DFlashHsNixlProbe:
             )
         if not self._handshook:
             self.handshake()
+        self._hs_src_released.clear()
         hs = hidden_states
 
         def _worker() -> None:
@@ -839,6 +866,8 @@ class DFlashHsNixlProbe:
                     self.transfer(hs, src_ready_event=src_ready_event)
             except BaseException as e:
                 self._bg_error = e
+            finally:
+                self._hs_src_released.set()
 
         self._bg_thread = threading.Thread(
             target=_worker, name="dflash-hs-nixl-xfer", daemon=True

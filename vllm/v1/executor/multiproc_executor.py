@@ -115,7 +115,8 @@ class MultiprocExecutor(Executor):
         self.failure_callback: FailureCallback | None = None
         # Engine←worker draft publish path (async remote verify). Created before
         # workers spawn so both ends share the same Queue.
-        self._async_draft_side_queue: multiprocessing.Queue | None = None
+        # mp.Queue is a factory method, not a type — annotate as Any.
+        self._async_draft_side_queue: Any | None = None
         spec_cfg = self.vllm_config.speculative_config
         if (
             spec_cfg is not None
@@ -636,7 +637,7 @@ class WorkerProc:
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
-        async_draft_side_queue: multiprocessing.Queue | None = None,
+        async_draft_side_queue: Any | None = None,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
@@ -710,7 +711,7 @@ class WorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
-        async_draft_side_queue: multiprocessing.Queue | None = None,
+        async_draft_side_queue: Any | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent

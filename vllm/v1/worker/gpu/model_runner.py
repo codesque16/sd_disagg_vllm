@@ -781,23 +781,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         probe = getattr(getattr(self, "speculator", None), "_hs_nixl_probe", None)
         if probe is not None and finished_req_ids:
             spec = getattr(self, "speculator", None)
-            try:
-                # FREE may drain an in-flight SPECulate to keep DEALER in-order.
-                drained = probe.free(list(finished_req_ids))
-            except Exception:
-                logger.exception("DFlash HS NIXL FREE failed")
+            # Async verify: never join in-flight SPECulate on this thread (that
+            # Thread.join is the nsys sem_wait hole under remote draft). Defer
+            # FREE until the socket is idle via speculator.free_remote_kv.
+            if (
+                spec is not None
+                and getattr(spec, "async_verify", False)
+                and hasattr(spec, "free_remote_kv")
+            ):
+                spec._remote_dual_run_deferred = False
+                spec._deferred_local_draft = None
+                spec.free_remote_kv(set(finished_req_ids))
             else:
-                if spec is not None:
-                    spec._remote_dual_run_deferred = False
-                    spec._deferred_local_draft = None
-                    # Never clear_async_draft_state here: that drops ready/pending
-                    # drafts for still-running reqs and deadlocks wait-for-drafts.
-                    if getattr(spec, "async_verify", False) and hasattr(
-                        spec, "recover_async_drafts_after_socket_drain"
-                    ):
-                        spec.recover_async_drafts_after_socket_drain(
-                            drained, exclude_req_ids=set(finished_req_ids)
-                        )
+                try:
+                    # FREE may drain an in-flight SPECulate to keep DEALER in-order.
+                    drained = probe.free(list(finished_req_ids))
+                except Exception:
+                    logger.exception("DFlash HS NIXL FREE failed")
+                else:
+                    if spec is not None:
+                        spec._remote_dual_run_deferred = False
+                        spec._deferred_local_draft = None
+                        # Never clear_async_draft_state here: that drops ready/pending
+                        # drafts for still-running reqs and deadlocks wait-for-drafts.
+                        if getattr(spec, "async_verify", False) and hasattr(
+                            spec, "recover_async_drafts_after_socket_drain"
+                        ):
+                            spec.recover_async_drafts_after_socket_drain(
+                                drained, exclude_req_ids=set(finished_req_ids)
+                            )
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 

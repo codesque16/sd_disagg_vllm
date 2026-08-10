@@ -137,6 +137,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._async_draft_side_queue: Any | None = None
         # Optional install into req_states.draft_tokens (model_runner hook).
         self._async_draft_install_fn: Any | None = None
+        # FREE while SPECulate is in flight: do not join the bg recv on the
+        # execute thread (Thread.join → sem_wait hole aligned with remote draft).
+        # Queue ids and send FREE once the socket is idle (after reply / poll).
+        self._async_deferred_free_ids: set[str] = set()
         addr = self.speculative_config.disagg_dflash_address
         if addr:
             from vllm.v1.spec_decode.dflash_hs_nixl import DFlashHsNixlProbe
@@ -439,6 +443,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
+        # Wait only until prior NIXL staging released the source HS — before
+        # overwrite. Do not join remote SPECulate recv for this barrier.
+        if (
+            self._hs_nixl_probe is not None
+            and self.async_verify
+            and not dummy_run
+        ):
+            self._hs_nixl_probe.wait_hs_src_released()
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         # Milestone-2 remote-only: kick SPECulate, block for draft tokens, skip
@@ -651,21 +663,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         # the just-sampled batch never gets SPECulate and stays unscheduled forever
         # (common with prefill-while-waiting or batch_queue overlap). Always catch
         # up — non-blocking first, then block — and queue ready drafts for poll.
+        #
+        # Also join when the bg callback already cleared `_async_pending_req_ids`
+        # but `_bg_thread` has not been joined yet — otherwise begin_speculate
+        # raises "prior transfer/reply pending" on the next prefill kick.
         vi = int(getattr(self, "last_verify_step", 0) or 0)
-        if self.async_verify and self._async_pending_req_ids is not None:
+        if self.async_verify and (
+            self._async_pending_req_ids is not None or self._probe_socket_busy()
+        ):
             torch.cuda.nvtx.range_push(
                 f"dflash_hs_nixl_async_catchup_wait_vi{vi}"
             )
             try:
                 if not self._resolve_async_remote_drafts(blocking=False):
                     self._resolve_async_remote_drafts(blocking=True)
-                if self._async_pending_req_ids is not None:
+                if self._async_pending_req_ids is not None or self._probe_socket_busy():
                     raise RuntimeError(
                         "DFlash async remote-only: prior SPECulate still pending "
                         "after catchup; cannot kick a new batch"
                     )
             finally:
                 torch.cuda.nvtx.range_pop()
+            # Socket idle after catchup — send any FREEs deferred off execute start.
+            self._flush_deferred_frees_if_idle()
 
         if not hasattr(self, "_hs_ready_event"):
             self._hs_ready_event = torch.cuda.Event()
@@ -767,32 +787,135 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._async_draft_side_queue = side_queue
         self._async_draft_install_fn = install_fn
 
+    def _probe_socket_busy(self) -> bool:
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return False
+        return (
+            probe._bg_thread is not None
+            or getattr(probe, "_speculate_pending", False)
+        )
+
+    def free_remote_kv(self, req_ids: set[str]) -> None:
+        """FREE draft-side KV without joining an in-flight SPECulate on execute.
+
+        If the DEALER socket is busy, defer the FREE until after the reply
+        (flushed from poll / catchup). Joining here was the nsys ``sem_wait``
+        hole aligned with ``speculate_recv``.
+        """
+        exclude = set(req_ids)
+        if not exclude:
+            return
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+
+        # Drop dead reqs from local async bookkeeping immediately.
+        self._prune_async_ready_queue(exclude)
+
+        busy = self._probe_socket_busy() or (
+            self._async_pending_req_ids is not None
+        )
+        if self.async_verify and busy:
+            with self._async_lock:
+                self._async_deferred_free_ids |= exclude
+            torch.cuda.nvtx.range_push(
+                f"dflash_hs_nixl_free_deferred_n{len(exclude)}"
+            )
+            torch.cuda.nvtx.range_pop()
+            return
+
+        try:
+            drained = probe.free(list(exclude))
+        except Exception:
+            logger.exception("DFlash HS NIXL FREE failed")
+            drained = None
+        else:
+            self._remote_dual_run_deferred = False
+            self._deferred_local_draft = None
+            if self.async_verify:
+                self.recover_async_drafts_after_socket_drain(
+                    drained, exclude_req_ids=exclude
+                )
+
+    def _flush_deferred_frees_if_idle(self) -> None:
+        """Send any deferred FREEs once the SPECulate socket is idle."""
+        with self._async_lock:
+            if not self._async_deferred_free_ids:
+                return
+        if self._probe_socket_busy() or self._async_pending_req_ids is not None:
+            return
+        with self._async_lock:
+            ids = set(self._async_deferred_free_ids)
+            self._async_deferred_free_ids.clear()
+        if not ids:
+            return
+        probe = self._hs_nixl_probe
+        assert probe is not None
+        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_deferred_free_n{len(ids)}")
+        try:
+            try:
+                drained = probe.free(list(ids))
+            except Exception:
+                logger.exception("DFlash HS NIXL deferred FREE failed")
+                drained = None
+            else:
+                self.recover_async_drafts_after_socket_drain(
+                    drained, exclude_req_ids=ids
+                )
+        finally:
+            torch.cuda.nvtx.range_pop()
+
     def _on_async_speculate_reply(self, remote: torch.Tensor) -> None:
         """Bg-thread callback: stage drafts, install on GPU, publish CPU to engine."""
+        publish: tuple[list[str], torch.Tensor, torch.Tensor, torch.Tensor] | None
         with self._async_lock:
             req_ids = self._async_pending_req_ids
             idx_mapping = self._async_pending_idx_mapping
             if req_ids is None or idx_mapping is None:
                 return
-            self._stash_async_ready_drafts(
-                req_ids=req_ids,
-                idx_mapping=idx_mapping,
-                remote=remote,
-                already_locked=True,
-            )
-            if not self._async_ready_queue:
-                return
-            # Prefer immediate install + side-channel publish so the engine can
-            # schedule without an RPC poll stuck behind execute_model.
-            use_side = self._async_draft_side_queue is not None
-            if use_side:
-                req_ids, idx_mapping, remote_gpu, remote_cpu = (
-                    self._async_ready_queue.pop()
-                )
+            # Drop drafts for reqs with deferred FREE (finished while in flight).
+            exclude = set(self._async_deferred_free_ids)
+            if exclude:
+                keep = [i for i, r in enumerate(req_ids) if r not in exclude]
+                if not keep:
+                    self._async_pending_req_ids = None
+                    self._async_pending_idx_mapping = None
+                    self._async_pending_num_reqs = 0
+                    publish = None
+                else:
+                    t = torch.tensor(keep, dtype=torch.long)
+                    self._stash_async_ready_drafts(
+                        req_ids=[req_ids[i] for i in keep],
+                        idx_mapping=idx_mapping[t],
+                        remote=remote[t],
+                        already_locked=True,
+                    )
+                    if not self._async_ready_queue:
+                        publish = None
+                    elif self._async_draft_side_queue is not None:
+                        publish = self._async_ready_queue.pop()
+                    else:
+                        publish = self._async_ready_queue[-1]
             else:
-                req_ids, idx_mapping, remote_gpu, remote_cpu = self._async_ready_queue[
-                    -1
-                ]
+                self._stash_async_ready_drafts(
+                    req_ids=req_ids,
+                    idx_mapping=idx_mapping,
+                    remote=remote,
+                    already_locked=True,
+                )
+                if not self._async_ready_queue:
+                    publish = None
+                elif self._async_draft_side_queue is not None:
+                    # Prefer immediate install + side-channel publish so the engine
+                    # can schedule without an RPC poll stuck behind execute_model.
+                    publish = self._async_ready_queue.pop()
+                else:
+                    publish = self._async_ready_queue[-1]
+
+        if publish is None:
+            return
+        req_ids, idx_mapping, remote_gpu, remote_cpu = publish
 
         install_fn = self._async_draft_install_fn
         if install_fn is not None:
@@ -893,11 +1016,26 @@ class DFlashSpeculator(DraftModelSpeculator):
                 _do()
 
     def _resolve_async_remote_drafts(self, *, blocking: bool) -> bool:
-        """Try to complete an in-flight async SPECulate. Returns True if pending cleared."""
-        with self._async_lock:
-            if self._async_pending_req_ids is None:
-                return True
+        """Try to complete an in-flight async SPECulate. Returns True if idle for kick.
+
+        Idle means: no tracked pending batch **and** probe bg/socket not busy.
+        The bg reply callback may clear `_async_pending_req_ids` before the
+        transfer thread exits; we still must join before the next kick.
+        """
         probe = self._hs_nixl_probe
+        with self._async_lock:
+            pending = self._async_pending_req_ids is not None
+        if not pending:
+            if probe is None or not self._probe_socket_busy():
+                return True
+            # Pending already stashed/dropped; only need to join the bg thread.
+            if blocking:
+                probe.finish_speculate()
+                return not self._probe_socket_busy()
+            # Reply already consumed by callback path; join if thread has exited.
+            probe.try_finish_speculate()
+            return not self._probe_socket_busy()
+
         if probe is None:
             return False
         if blocking:
@@ -907,7 +1045,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Bg callback may have stashed while we joined/recv'd.
         with self._async_lock:
             if self._async_pending_req_ids is None:
-                return True
+                return not self._probe_socket_busy()
         if remote is None:
             # Not ready yet, or drained by FREE while we still tracked pending.
             if blocking:
@@ -915,10 +1053,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                     self._async_pending_req_ids = None
                     self._async_pending_idx_mapping = None
                     self._async_pending_num_reqs = 0
+                return not self._probe_socket_busy()
             return False
         with self._async_lock:
             if self._async_pending_req_ids is None:
-                return True
+                return not self._probe_socket_busy()
             assert self._async_pending_idx_mapping is not None
             self._stash_async_ready_drafts(
                 req_ids=self._async_pending_req_ids,
@@ -926,7 +1065,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 remote=remote,
                 already_locked=True,
             )
-        return True
+        return not self._probe_socket_busy()
 
     def clear_async_draft_state(self) -> None:
         """Drop in-flight / ready async draft bookkeeping (shutdown / hard reset)."""
@@ -934,6 +1073,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._async_pending_idx_mapping = None
         self._async_pending_num_reqs = 0
         self._async_ready_queue.clear()
+        self._async_deferred_free_ids.clear()
 
     def recover_async_drafts_after_socket_drain(
         self,
@@ -1012,6 +1152,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         torch.cuda.nvtx.range_push(f"dflash_hs_nixl_async_poll_vi{vi}")
         try:
             self._resolve_async_remote_drafts(blocking=False)
+            # After reply (or idle), send FREEs deferred off execute start.
+            self._flush_deferred_frees_if_idle()
             with self._async_lock:
                 if not self._async_ready_queue:
                     return None
