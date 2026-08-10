@@ -122,6 +122,16 @@ class DFlashHsNixlProbe:
         self._copy_stream: torch.cuda.Stream | None = None
         self._staging_done_event: torch.cuda.Event | None = None
         self._meta_done_event: torch.cuda.Event | None = None
+        # Pinned host staging for SPECulate meta DtoH. `.to("cpu", non_blocking=True)`
+        # into *unpinned* memory still issues cudaStreamSynchronize; pinned copy_
+        # is required for a true async kick.
+        self._meta_pin_positions: torch.Tensor | None = None
+        self._meta_pin_num_sampled: torch.Tensor | None = None
+        self._meta_pin_num_rejected: torch.Tensor | None = None
+        self._meta_pin_last_sampled: torch.Tensor | None = None
+        self._meta_pin_next_prefill: torch.Tensor | None = None
+        self._meta_pin_temperature: torch.Tensor | None = None
+        self._meta_pin_seeds: torch.Tensor | None = None
 
     def handshake(self) -> None:
         if self._handshook:
@@ -184,6 +194,7 @@ class DFlashHsNixlProbe:
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._staging_done_event = torch.cuda.Event()
         self._meta_done_event = torch.cuda.Event()
+        self._alloc_meta_pins()
 
         self._handshook = True
         logger.info(
@@ -364,6 +375,155 @@ class DFlashHsNixlProbe:
         if err is not None:
             raise RuntimeError(f"DFlash HS NIXL background transfer failed: {err}") from err
 
+    def _alloc_meta_pins(self) -> None:
+        """Pinned host buffers for non-blocking SPECulate meta DtoH.
+
+        Allocate outside InferenceMode so bg-thread / non-IM paths can copy_
+        into them after handshake ran under InferenceMode.
+        """
+        mt = self._max_tokens
+        # Upper-bound reqs by max_tokens (decode is 1 token/req; prefill is fewer).
+        with torch.inference_mode(False):
+            self._meta_pin_positions = torch.empty(
+                mt, dtype=torch.int64, pin_memory=True
+            )
+            self._meta_pin_num_sampled = torch.empty(
+                mt, dtype=torch.int32, pin_memory=True
+            )
+            self._meta_pin_num_rejected = torch.empty(
+                mt, dtype=torch.int32, pin_memory=True
+            )
+            self._meta_pin_last_sampled = torch.empty(
+                mt, dtype=torch.int64, pin_memory=True
+            )
+            self._meta_pin_next_prefill = torch.empty(
+                mt, dtype=torch.int64, pin_memory=True
+            )
+            self._meta_pin_temperature = torch.empty(
+                mt, dtype=torch.float32, pin_memory=True
+            )
+            self._meta_pin_seeds = torch.empty(mt, dtype=torch.int64, pin_memory=True)
+
+    def _enqueue_meta_dtoh(
+        self,
+        *,
+        n_ctx: int,
+        num_reqs: int,
+        positions: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        idx_mapping: torch.Tensor | np.ndarray,
+        src_ready_event: torch.cuda.Event | None,
+    ) -> dict[str, torch.Tensor]:
+        """Enqueue GPU→pinned DtoH on the copy stream; does not synchronize.
+
+        Returns host tensor views into the pinned staging buffers. Valid only
+        after ``_meta_done_event`` is synchronized. For async verify this runs
+        on the bg transfer thread (never on the propose/kick thread).
+        """
+        assert self._copy_stream is not None
+        assert self._meta_done_event is not None
+        assert self._meta_pin_positions is not None
+        assert self._meta_pin_num_sampled is not None
+        assert self._meta_pin_num_rejected is not None
+        assert self._meta_pin_last_sampled is not None
+        assert self._meta_pin_next_prefill is not None
+        assert self._meta_pin_temperature is not None
+        assert self._meta_pin_seeds is not None
+
+        if isinstance(idx_mapping, np.ndarray):
+            idx = torch.as_tensor(
+                idx_mapping[:num_reqs], dtype=torch.long, device=self.device
+            )
+        else:
+            idx = idx_mapping[:num_reqs].long()
+
+        # Wait only for HS/meta producers, not a full default-stream drain on
+        # this thread. Sync of meta_done happens on the bg thread (async) or
+        # explicitly after this returns (sync path).
+        if src_ready_event is not None:
+            self._copy_stream.wait_event(src_ready_event)
+        else:
+            ready = torch.cuda.Event()
+            ready.record()
+            self._copy_stream.wait_event(ready)
+
+        def _gather(t: torch.Tensor) -> torch.Tensor:
+            g = t.reshape(t.shape[0], -1)[idx, 0] if t.ndim > 1 else t[idx]
+            return g.reshape(-1).contiguous()
+
+        pin_pos = self._meta_pin_positions[:n_ctx]
+        pin_ns = self._meta_pin_num_sampled[:num_reqs]
+        pin_nr = self._meta_pin_num_rejected[:num_reqs]
+        pin_ls = self._meta_pin_last_sampled[:num_reqs]
+        pin_np = self._meta_pin_next_prefill[:num_reqs]
+        pin_temp = self._meta_pin_temperature[:num_reqs]
+        pin_seeds = self._meta_pin_seeds[:num_reqs]
+
+        with torch.cuda.stream(self._copy_stream):
+            # dtype/device normalize on GPU, then pinned copy_ (true async DtoH).
+            pos_src = positions[:n_ctx].detach().to(
+                dtype=pin_pos.dtype, device=self.device
+            ).contiguous()
+            pin_pos.copy_(pos_src, non_blocking=True)
+            pos_src.record_stream(self._copy_stream)
+
+            ns_src = (
+                num_sampled[:num_reqs]
+                .reshape(-1)
+                .detach()
+                .to(dtype=pin_ns.dtype, device=self.device)
+                .contiguous()
+            )
+            pin_ns.copy_(ns_src, non_blocking=True)
+            ns_src.record_stream(self._copy_stream)
+
+            nr_src = (
+                num_rejected[:num_reqs]
+                .reshape(-1)
+                .detach()
+                .to(dtype=pin_nr.dtype, device=self.device)
+                .contiguous()
+            )
+            pin_nr.copy_(nr_src, non_blocking=True)
+            nr_src.record_stream(self._copy_stream)
+
+            ls_src = _gather(last_sampled).to(dtype=pin_ls.dtype, device=self.device)
+            pin_ls.copy_(ls_src, non_blocking=True)
+            ls_src.record_stream(self._copy_stream)
+
+            np_src = _gather(next_prefill_tokens).to(
+                dtype=pin_np.dtype, device=self.device
+            )
+            pin_np.copy_(np_src, non_blocking=True)
+            np_src.record_stream(self._copy_stream)
+
+            temp_src = _gather(temperature).to(
+                dtype=pin_temp.dtype, device=self.device
+            )
+            pin_temp.copy_(temp_src, non_blocking=True)
+            temp_src.record_stream(self._copy_stream)
+
+            seeds_src = _gather(seeds).to(dtype=pin_seeds.dtype, device=self.device)
+            pin_seeds.copy_(seeds_src, non_blocking=True)
+            seeds_src.record_stream(self._copy_stream)
+
+            self._meta_done_event.record(self._copy_stream)
+
+        return {
+            "positions": pin_pos,
+            "num_sampled": pin_ns,
+            "num_rejected": pin_nr,
+            "last_sampled": pin_ls,
+            "next_prefill_tokens": pin_np,
+            "temperature": pin_temp,
+            "seeds": pin_seeds,
+        }
+
     def begin_speculate(
         self,
         hidden_states: torch.Tensor,
@@ -382,11 +542,20 @@ class DFlashHsNixlProbe:
         seq_lens_cpu_upper_bound: torch.Tensor | np.ndarray,
         idx_mapping: torch.Tensor | np.ndarray,
         src_ready_event: torch.cuda.Event | None = None,
+        defer_meta_sync: bool = False,
+        verify_step: int = 0,
+        kick_iter: int = 0,
     ) -> None:
         """Kick NIXL on a side thread; return immediately.
 
-        On this thread: pack+send SPECulate meta (sink can CPU-prep early).
-        Bg: stage → PtoP → HS_READY. Sink waits on HS_READY before precompute.
+        Default: pack+send SPECulate meta on this thread (sink CPU-prep ∥ PtoP),
+        then bg stage → PtoP → HS_READY.
+
+        With ``defer_meta_sync=True`` (async verify): the propose/kick thread
+        only snapshots host-side meta and starts the bg thread — **no CUDA
+        enqueue or stream sync**. Bg does meta DtoH → wait → SPECulate send →
+        stage/PtoP/HS_READY so ``sample_tokens`` can return and the next
+        ``execute_context`` can be submitted while GPU0 still drains.
         """
         if self._bg_thread is not None or getattr(self, "_speculate_pending", False):
             raise RuntimeError(
@@ -399,128 +568,174 @@ class DFlashHsNixlProbe:
         n_ctx = int(hs.shape[0])
         num_reqs = len(req_ids)
         req_ids_list = list(req_ids)
+        # Sync path: host_meta already on pinned buffers after enqueue+sync.
+        # Async path: deferred_pack carries host snapshots + GPU tensor refs;
+        # bg runs _enqueue_meta_dtoh then encode/send.
+        deferred_pack: dict[str, Any] | None = None
+        host_meta_ready: dict[str, Any] | None = None
+        frames: list[bytes] | None = None
         sent_speculate = False
 
-        # Pack + send on the caller thread *before* local draft / NIXL so:
-        # - SPECulate reaches the sink early (CPU prep ∥ PtoP)
-        # - _speculate_pending is set before bg runs (PROFILE can drain safely)
-        if self.draft_enabled:
-            torch.cuda.nvtx.range_push("dflash_hs_nixl_meta_pack")
-            try:
-                if isinstance(num_scheduled_tokens, np.ndarray):
-                    nst = np.array(num_scheduled_tokens[:num_reqs], copy=True)
-                else:
-                    nst = (
-                        num_scheduled_tokens[:num_reqs]
-                        .detach()
-                        .to(dtype=torch.int32, device="cpu")
-                        .numpy()
+        def _snapshot_host_meta() -> tuple[np.ndarray, Any, Any]:
+            # Already-host fields only (numpy / CPU copies — no CUDA sync).
+            if isinstance(num_scheduled_tokens, np.ndarray):
+                nst = np.array(num_scheduled_tokens[:num_reqs], copy=True)
+            else:
+                nst_t = num_scheduled_tokens[:num_reqs]
+                if nst_t.device.type != "cpu":
+                    raise RuntimeError(
+                        "DFlash HS NIXL meta_pack expects num_scheduled_tokens "
+                        "on host (ndarray/CPU); GPU path would sync."
                     )
+                nst = nst_t.detach().to(dtype=torch.int32).numpy()
 
-                if isinstance(query_start_loc, np.ndarray):
-                    qsl_host: torch.Tensor | np.ndarray = np.array(
-                        query_start_loc[: num_reqs + 1], copy=True
-                    )
-                else:
-                    qsl_host = query_start_loc[: num_reqs + 1].detach().cpu()
-
-                if isinstance(seq_lens_cpu_upper_bound, np.ndarray):
-                    seq_host: torch.Tensor | np.ndarray = np.array(
-                        seq_lens_cpu_upper_bound[:num_reqs], copy=True
-                    )
-                elif (
-                    isinstance(seq_lens_cpu_upper_bound, torch.Tensor)
-                    and seq_lens_cpu_upper_bound.device.type == "cpu"
-                ):
-                    seq_host = (
-                        seq_lens_cpu_upper_bound[:num_reqs].detach().contiguous()
-                    )
-                else:
-                    seq_host = seq_lens_cpu_upper_bound[:num_reqs].detach().cpu()
-
-                if isinstance(idx_mapping, np.ndarray):
-                    idx = torch.as_tensor(
-                        idx_mapping[:num_reqs], dtype=torch.long, device=self.device
-                    )
-                else:
-                    idx = idx_mapping[:num_reqs].long()
-
-                assert self._copy_stream is not None
-                assert self._meta_done_event is not None
-                ready = torch.cuda.Event()
-                ready.record()
-                self._copy_stream.wait_event(ready)
-
-                def _gather_host(t: torch.Tensor) -> torch.Tensor:
-                    g = (
-                        t.reshape(t.shape[0], -1)[idx, 0]
-                        if t.ndim > 1
-                        else t[idx]
-                    )
-                    return g.reshape(-1).contiguous()
-
-                with torch.cuda.stream(self._copy_stream):
-                    positions_host = (
-                        positions[:n_ctx]
-                        .detach()
-                        .contiguous()
-                        .to("cpu", non_blocking=True)
-                    )
-                    num_sampled_host = (
-                        num_sampled[:num_reqs]
-                        .reshape(-1)
-                        .contiguous()
-                        .to("cpu", non_blocking=True)
-                    )
-                    num_rejected_host = (
-                        num_rejected[:num_reqs]
-                        .reshape(-1)
-                        .contiguous()
-                        .to("cpu", non_blocking=True)
-                    )
-                    last_sampled_host = _gather_host(last_sampled).to(
-                        "cpu", non_blocking=True
-                    )
-                    next_prefill_host = _gather_host(next_prefill_tokens).to(
-                        "cpu", non_blocking=True
-                    )
-                    temperature_host = _gather_host(temperature).to(
-                        "cpu", non_blocking=True
-                    )
-                    seeds_host = _gather_host(seeds).to("cpu", non_blocking=True)
-                    self._meta_done_event.record(self._copy_stream)
-                # Only wait for meta DtoH (copy stream), not the whole default stream.
-                self._meta_done_event.synchronize()
-
-                frames = encode_speculate_request(
-                    req_ids=req_ids_list,
-                    num_ctx_tokens=n_ctx,
-                    num_speculative_tokens=num_speculative_tokens,
-                    positions=positions_host,
-                    query_start_loc=qsl_host,
-                    num_sampled=num_sampled_host,
-                    num_rejected=num_rejected_host,
-                    last_sampled=last_sampled_host,
-                    next_prefill_tokens=next_prefill_host,
-                    temperature=temperature_host,
-                    seeds=seeds_host,
-                    num_scheduled_tokens=nst,
-                    seq_lens_cpu_upper_bound=seq_host,
+            if isinstance(query_start_loc, np.ndarray):
+                qsl_host: torch.Tensor | np.ndarray = np.array(
+                    query_start_loc[: num_reqs + 1], copy=True
                 )
-            finally:
-                torch.cuda.nvtx.range_pop()
+            else:
+                qsl_t = query_start_loc[: num_reqs + 1]
+                if qsl_t.device.type != "cpu":
+                    raise RuntimeError(
+                        "DFlash HS NIXL meta_pack expects query_start_loc on host"
+                    )
+                qsl_host = qsl_t.detach().contiguous()
 
-            torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate_send")
-            try:
-                self._sock.send_multipart(frames)
-                self._speculate_pending = True
+            if isinstance(seq_lens_cpu_upper_bound, np.ndarray):
+                seq_host: torch.Tensor | np.ndarray = np.array(
+                    seq_lens_cpu_upper_bound[:num_reqs], copy=True
+                )
+            else:
+                seq_t = seq_lens_cpu_upper_bound[:num_reqs]
+                if seq_t.device.type != "cpu":
+                    raise RuntimeError(
+                        "DFlash HS NIXL meta_pack expects "
+                        "seq_lens_cpu_upper_bound on host"
+                    )
+                seq_host = seq_t.detach().contiguous()
+            return nst, qsl_host, seq_host
+
+        if self.draft_enabled:
+            if defer_meta_sync:
+                # Propose thread: host snapshot only. Any CUDA in meta_pack here
+                # historically became cudaStreamSynchronize on the compute stream
+                # (~tens of ms) and blocked the next execute_context submit.
+                torch.cuda.nvtx.range_push("dflash_hs_nixl_meta_pack")
+                try:
+                    nst, qsl_host, seq_host = _snapshot_host_meta()
+                    deferred_pack = {
+                        "req_ids": req_ids_list,
+                        "num_ctx_tokens": n_ctx,
+                        "num_speculative_tokens": num_speculative_tokens,
+                        "query_start_loc": qsl_host,
+                        "num_scheduled_tokens": nst,
+                        "seq_lens_cpu_upper_bound": seq_host,
+                        "positions": positions,
+                        "num_sampled": num_sampled,
+                        "num_rejected": num_rejected,
+                        "last_sampled": last_sampled,
+                        "next_prefill_tokens": next_prefill_tokens,
+                        "temperature": temperature,
+                        "seeds": seeds,
+                        "idx_mapping": idx_mapping,
+                        "verify_step": int(verify_step),
+                        "kick_iter": int(kick_iter),
+                    }
+                finally:
+                    torch.cuda.nvtx.range_pop()
+                # Bg will send; treat as in-flight so HS_READY is still emitted.
                 sent_speculate = True
-            finally:
-                torch.cuda.nvtx.range_pop()
+            else:
+                torch.cuda.nvtx.range_push("dflash_hs_nixl_meta_pack")
+                try:
+                    nst, qsl_host, seq_host = _snapshot_host_meta()
+                    host_meta_ready = self._enqueue_meta_dtoh(
+                        n_ctx=n_ctx,
+                        num_reqs=num_reqs,
+                        positions=positions,
+                        num_sampled=num_sampled,
+                        num_rejected=num_rejected,
+                        last_sampled=last_sampled,
+                        next_prefill_tokens=next_prefill_tokens,
+                        temperature=temperature,
+                        seeds=seeds,
+                        idx_mapping=idx_mapping,
+                        src_ready_event=src_ready_event,
+                    )
+                    assert self._meta_done_event is not None
+                    self._meta_done_event.synchronize()
+                    frames = encode_speculate_request(
+                        req_ids=req_ids_list,
+                        num_ctx_tokens=n_ctx,
+                        num_speculative_tokens=num_speculative_tokens,
+                        query_start_loc=qsl_host,
+                        num_scheduled_tokens=nst,
+                        seq_lens_cpu_upper_bound=seq_host,
+                        verify_step=int(verify_step),
+                        kick_iter=int(kick_iter),
+                        **host_meta_ready,
+                    )
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate_send")
+                try:
+                    self._sock.send_multipart(frames)
+                    self._speculate_pending = True
+                    sent_speculate = True
+                finally:
+                    torch.cuda.nvtx.range_pop()
 
         def _worker() -> None:
             try:
                 torch.cuda.set_device(self.device)
+                if deferred_pack is not None:
+                    assert self._meta_done_event is not None
+                    # Full meta DtoH + wait on bg — not under async_kick.
+                    torch.cuda.nvtx.range_push("dflash_hs_nixl_meta_pack")
+                    try:
+                        host_meta = self._enqueue_meta_dtoh(
+                            n_ctx=int(deferred_pack["num_ctx_tokens"]),
+                            num_reqs=len(deferred_pack["req_ids"]),
+                            positions=deferred_pack["positions"],
+                            num_sampled=deferred_pack["num_sampled"],
+                            num_rejected=deferred_pack["num_rejected"],
+                            last_sampled=deferred_pack["last_sampled"],
+                            next_prefill_tokens=deferred_pack["next_prefill_tokens"],
+                            temperature=deferred_pack["temperature"],
+                            seeds=deferred_pack["seeds"],
+                            idx_mapping=deferred_pack["idx_mapping"],
+                            src_ready_event=src_ready_event,
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("dflash_hs_nixl_meta_pack_wait")
+                    try:
+                        self._meta_done_event.synchronize()
+                        frames_bg = encode_speculate_request(
+                            req_ids=deferred_pack["req_ids"],
+                            num_ctx_tokens=deferred_pack["num_ctx_tokens"],
+                            num_speculative_tokens=deferred_pack[
+                                "num_speculative_tokens"
+                            ],
+                            query_start_loc=deferred_pack["query_start_loc"],
+                            num_scheduled_tokens=deferred_pack["num_scheduled_tokens"],
+                            seq_lens_cpu_upper_bound=deferred_pack[
+                                "seq_lens_cpu_upper_bound"
+                            ],
+                            verify_step=int(deferred_pack.get("verify_step", 0)),
+                            kick_iter=int(deferred_pack.get("kick_iter", 0)),
+                            **host_meta,
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+                    torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate_send")
+                    try:
+                        self._sock.send_multipart(frames_bg)
+                        self._speculate_pending = True
+                    finally:
+                        torch.cuda.nvtx.range_pop()
+
                 with torch.inference_mode():
                     torch.cuda.nvtx.range_push("dflash_hs_nixl_stage")
                     try:
@@ -602,18 +817,48 @@ class DFlashHsNixlProbe:
             self._speculate_pending = False
             torch.cuda.nvtx.range_pop()
 
-    def free(self, req_ids: list[str]) -> None:
+    def try_finish_speculate(self) -> torch.Tensor | None:
+        """Non-blocking SPECulate recv. None if not ready / draft off / no pending.
+
+        Does not join a still-running bg transfer thread (sink only replies after
+        HS_READY, so a live bg means the reply cannot be ready yet). When the bg
+        thread has exited, joins to surface transfer errors, then NOBLOCK recv.
+        """
+        t = self._bg_thread
+        if t is not None and t.is_alive():
+            return None
+        self._join_bg()
+        if not self.draft_enabled or not getattr(self, "_speculate_pending", False):
+            return None
+        torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate_try")
+        try:
+            try:
+                reply = self._sock.recv_multipart(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                return None
+            self._speculate_pending = False
+            return decode_speculate_response(reply)
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+    def free(self, req_ids: list[str]) -> torch.Tensor | None:
+        """FREE draft-side KV. Returns a SPECulate reply drained to clear the socket.
+
+        Callers (async verify) must stash that reply for still-running reqs — do not
+        drop it. Returning None means no in-flight SPECulate was drained.
+        """
         if not req_ids:
-            return
+            return None
         if not self._handshook:
             self.handshake()
+        drained: torch.Tensor | None = None
         if not self.draft_enabled:
             self._join_bg()
-            return
+            return None
         # Drain any in-flight SPECulate so FREE is not interleaved on the socket.
         if self._bg_thread is not None or self._speculate_pending:
             try:
-                self.finish_speculate()
+                drained = self.finish_speculate()
             except Exception as e:
                 logger.warning("DFlash HS NIXL drain before FREE failed: %s", e)
                 self._speculate_pending = False
@@ -626,20 +871,25 @@ class DFlashHsNixlProbe:
             raise RuntimeError(f"FREE failed: {meta}")
         if meta.get("cmd") != CMD_FREE:
             raise RuntimeError(f"Unexpected FREE reply: {meta}")
+        return drained
 
-    def profile(self, start: bool) -> None:
+    def profile(self, start: bool) -> torch.Tensor | None:
         """Mirror verify cudaProfilerStart/Stop onto the sink GPU (nsys API range).
 
         Combined ``--capture-range=cudaProfilerApi`` only records CUDA contexts
         that call the API; without this, GPU1 shows PtoP (verify-initiated) but
         no draft kernels.
+
+        Returns a SPECulate reply drained to clear the socket (or None). Async
+        verify must stash it for still-running requests.
         """
         if not self._handshook:
             self.handshake()
+        drained: torch.Tensor | None = None
         # DEALER is in-order: never PROFILE while a SPECulate reply is pending.
         if self._bg_thread is not None or self._speculate_pending:
             try:
-                self.finish_speculate()
+                drained = self.finish_speculate()
             except Exception as e:
                 logger.warning("DFlash HS NIXL drain before PROFILE failed: %s", e)
                 self._speculate_pending = False
@@ -655,6 +905,7 @@ class DFlashHsNixlProbe:
                 logger.warning("Unexpected PROFILE reply: %s", meta)
         except zmq.ZMQError as e:
             logger.warning("DFlash HS NIXL PROFILE failed: %s", e)
+        return drained
 
     def close(self) -> None:
         try:

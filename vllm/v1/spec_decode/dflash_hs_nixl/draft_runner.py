@@ -159,6 +159,8 @@ class DFlashDraftRunner:
         self.block_size = int(block_size)
         self.device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
         self._gpu_memory_utilization = float(gpu_memory_utilization)
+        # Set by sink before each SPECulate: _si{N}_vi{V}_ki{K}_n{reqs}
+        self._nvtx_suffix: str = ""
 
         if max_num_batched_tokens is None:
             max_num_batched_tokens = min(
@@ -553,7 +555,8 @@ class DFlashDraftRunner:
 
         device = self.device
         dirty_block_reqs: list[str] = []
-        torch.cuda.nvtx.range_push("dflash_sink_prep_cpu")
+        sfx = getattr(self, "_nvtx_suffix", "") or ""
+        torch.cuda.nvtx.range_push(f"dflash_sink_prep_cpu{sfx}")
         try:
             def _host_1d(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
                 return t.detach().to(dtype=dtype).reshape(-1).contiguous()
@@ -613,13 +616,13 @@ class DFlashDraftRunner:
             torch.cuda.nvtx.range_pop()
 
         # Only flush slots that grew — one staged H2D like verify model_runner.
-        torch.cuda.nvtx.range_push("dflash_sink_pack_blocks")
+        torch.cuda.nvtx.range_push(f"dflash_sink_pack_blocks{sfx}")
         try:
             self._flush_dirty_block_tables(dirty_block_reqs)
         finally:
             torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("dflash_sink_h2d")
+        torch.cuda.nvtx.range_push(f"dflash_sink_h2d{sfx}")
         try:
             # Patch durable buffers (slot-indexed like verify req_states).
             assert self._query_start_loc_buf is not None
@@ -692,7 +695,7 @@ class DFlashDraftRunner:
         finally:
             torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("dflash_sink_prepare")
+        torch.cuda.nvtx.range_push(f"dflash_sink_prepare{sfx}")
         try:
             # Densify durable slot tables → batch-ordered input_block_tables.
             # prepare_dflash indexes block_table by batch row (not slot); same as
@@ -730,7 +733,7 @@ class DFlashDraftRunner:
         if wait_hiddens_ready is not None:
             wait_hiddens_ready()
 
-        torch.cuda.nvtx.range_push("dflash_sink_precompute")
+        torch.cuda.nvtx.range_push(f"dflash_sink_precompute{sfx}")
         try:
             if self.spec._layer_group_idx is not None:
                 context_slots: torch.Tensor | list[torch.Tensor | None] | None = [
@@ -747,7 +750,7 @@ class DFlashDraftRunner:
         finally:
             torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("dflash_sink_generate")
+        torch.cuda.nvtx.range_push(f"dflash_sink_generate{sfx}")
         try:
             num_query_tokens = num_reqs * self.spec.num_query_per_req
             batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(

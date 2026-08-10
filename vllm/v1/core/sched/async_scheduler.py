@@ -39,9 +39,14 @@ class AsyncScheduler(Scheduler):
             request.num_output_placeholders += (
                 self.num_sampled_tokens_per_step + cur_num_spec_tokens
             )
-            # Add placeholders for the new draft/spec tokens.
-            # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = self._spec_token_placeholders
+            if self.disagg_dflash_async_verify:
+                # Empty means decode is blocked until poll publishes real draft
+                # ids (never decode-1). Prefills of other requests stay eligible.
+                request.spec_token_ids = []
+            else:
+                # Add placeholders for the new draft/spec tokens.
+                # We will update the actual spec token ids in the worker process.
+                request.spec_token_ids = self._spec_token_placeholders
 
             if self.use_v2_model_runner:
                 # Set the next step index in which this request is eligible to be

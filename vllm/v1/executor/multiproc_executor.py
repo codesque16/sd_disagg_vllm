@@ -340,6 +340,11 @@ class MultiprocExecutor(Executor):
             "take_draft_token_ids", unique_reply_rank=self.output_rank
         )
 
+    def poll_async_remote_drafts(self) -> DraftTokenIds | None:
+        return self.collective_rpc(
+            "poll_async_remote_drafts", unique_reply_rank=self.output_rank
+        )
+
     def collective_rpc(  # type: ignore[override]
         self,
         method: str | Callable,

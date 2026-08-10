@@ -775,20 +775,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
-        # Dual-run remote draft: free draft-side KV for finished/preempted reqs.
+        # Dual-run / async remote draft: free draft-side KV for finished/preempted.
         probe = getattr(getattr(self, "speculator", None), "_hs_nixl_probe", None)
         if probe is not None and finished_req_ids:
+            spec = getattr(self, "speculator", None)
             try:
-                # FREE drains any in-flight SPECulate on the socket.
-                probe.free(list(finished_req_ids))
+                # FREE may drain an in-flight SPECulate to keep DEALER in-order.
+                drained = probe.free(list(finished_req_ids))
             except Exception:
                 logger.exception("DFlash HS NIXL FREE failed")
             else:
-                # Keep deferred dual-run bookkeeping in sync with the drain.
-                spec = getattr(self, "speculator", None)
                 if spec is not None:
                     spec._remote_dual_run_deferred = False
                     spec._deferred_local_draft = None
+                    # Never clear_async_draft_state here: that drops ready/pending
+                    # drafts for still-running reqs and deadlocks wait-for-drafts.
+                    if getattr(spec, "async_verify", False) and hasattr(
+                        spec, "recover_async_drafts_after_socket_drain"
+                    ):
+                        spec.recover_async_drafts_after_socket_drain(
+                            drained, exclude_req_ids=set(finished_req_ids)
+                        )
         for req_id in finished_req_ids:
             self._remove_request(req_id)
 
@@ -1174,6 +1181,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            # Propagate schedule step for DFlash NVTX correlation (kick/poll).
+            if self.speculator is not None:
+                self.speculator.last_verify_step = int(
+                    getattr(scheduler_output, "schedule_step", 0) or 0
+                )
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1535,21 +1547,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
             )
-            # Local draft-token memcpy (serving path) — do not block on GPU1 here.
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            # Async remote-only: propose returns None after kick; drafts are
+            # installed later via poll_async_remote_drafts().
+            if draft_tokens is not None:
+                # Local draft-token memcpy (serving path) — do not block on GPU1 here.
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
-            # Dual-run: defer ZMQ recv until the *next* propose so this worker
-            # can prepare/launch the next execute_context first.
-            if hasattr(self.speculator, "defer_remote_dual_run"):
-                self.speculator.defer_remote_dual_run(draft_tokens)
+                # Dual-run: defer ZMQ recv until the *next* propose so this worker
+                # can prepare/launch the next execute_context first.
+                if hasattr(self.speculator, "defer_remote_dual_run"):
+                    self.speculator.defer_remote_dual_run(draft_tokens)
 
-            if self.num_speculative_steps > 0:
-                # Spec-decode and diffusion LLMs both use draft tokens but the latter does
-                # not have a speculator (i.e. self.speculator is None)
-                self.draft_tokens_handler.set_draft_tokens(
-                    input_batch,
-                    self.req_states.draft_tokens[input_batch.idx_mapping],
-                )
+                if self.num_speculative_steps > 0:
+                    # Spec-decode and diffusion LLMs both use draft tokens but the
+                    # latter does not have a speculator (i.e. self.speculator is None)
+                    self.draft_tokens_handler.set_draft_tokens(
+                        input_batch,
+                        self.req_states.draft_tokens[input_batch.idx_mapping],
+                    )
 
         elif self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -1567,6 +1582,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
+
+    def poll_async_remote_drafts(self) -> DraftTokenIds | None:
+        """Install ready async remote drafts into req_states and return CPU ids.
+
+        Drains the speculator ready-queue fully (catchup-before-kick can stash
+        more than one SPECulate reply before the engine polls).
+        """
+        if self.speculator is None or not hasattr(
+            self.speculator, "poll_async_remote_drafts"
+        ):
+            return None
+        all_req_ids: list[str] = []
+        all_draft_ids: list[list[int]] = []
+        while True:
+            ready = self.speculator.poll_async_remote_drafts()
+            if ready is None:
+                break
+            req_ids, idx_mapping, draft_tokens, draft_tokens_cpu = ready
+            # Non-blocking install: H2D was already enqueued without stream sync.
+            self.req_states.draft_tokens[idx_mapping].copy_(
+                draft_tokens, non_blocking=True
+            )
+            all_req_ids.extend(req_ids)
+            # CPU ids come from the ZMQ host tensor — never DtoH on the poll path.
+            all_draft_ids.extend(draft_tokens_cpu.tolist())
+        if not all_req_ids:
+            return None
+        return DraftTokenIds(all_req_ids, all_draft_ids)
 
     @torch.inference_mode()
     @step_eplb_after()

@@ -44,6 +44,8 @@ HS_NIXL_SINK=0
 # Legacy Milestone-1 dual-run compare (requires remote_only=false; unused by default).
 DUAL_RUN_CHECK=0
 REMOTE_ONLY=1
+# Milestone-4: non-blocking remote propose + real spec_token_ids ready gating.
+ASYNC_VERIFY=0
 # Off by default: SD timing / Disagg profile use CUDA synchronize and skew TPOT.
 ENABLE_DISAGG_PROFILE=0
 # Default: synthetic rejection (paper A/B latency). --no-synthetic → real
@@ -129,6 +131,9 @@ Options:
                            still serves; remote draft for compare/profiling only)
   --dual-run-check         With --hs-nixl-sink --no-remote-only: compare remote vs
                            local draft tokens (adds GPU sync)
+  --async-verify           With --hs-nixl-sink remote-only: Milestone-4 async
+                           propose (disagg_dflash_async_verify=true; no [-1]*K
+                           placeholders; schedule SD only when draft ids ready)
   --no-disagg-async        disagg_dflash_async_complete=false (sync propose)
   --no-synthetic           real rejection sampling (rejection_sample_method=
                            standard). Default is synthetic rates for paper A/B.
@@ -190,6 +195,18 @@ Nsight tip:
       --num-prompts 8 --no-warmup --duration-sec 20
   # Ctrl+C / exit the launcher finalizes
   #   bench_results/PV1S1_b8192/nsys/PV1S1_b8192_combined_<ts>.nsys-rep
+
+  # Milestone-4 async remote-only overlap (HS NIXL sink + non-blocking propose):
+  ./launch_bench_server.sh PD1S1_b8192 --devices 0 --draft-devices 1 \\
+      --hs-nixl-sink --async-verify --nsys
+  ./benchmark_random.sh --tag PD1S1_b8192 --nsys --request-rates 4 \\
+      --num-prompts 32 --no-warmup --duration-sec 20
+  # In the combined .nsys-rep, look for:
+  #   sync baseline: long dflash_hs_nixl_remote_wait on GPU0 while GPU1
+  #     runs dflash_sink_generate (serialized)
+  #   async: short dflash_hs_nixl_async_kick, then GPU0 target kernels
+  #     overlap GPU1 dflash_sink_generate; remote_wait mostly gone
+  #     (async_catchup_wait should be rare)
 EOF
 }
 
@@ -320,15 +337,20 @@ spec_json() {
   if [[ "$HS_NIXL_SINK" -eq 1 ]]; then
     local dual_check="false"
     local remote_only="true"
+    local async_verify="false"
     [[ "${DUAL_RUN_CHECK:-0}" -eq 1 ]] && dual_check="true"
     [[ "${REMOTE_ONLY:-1}" -eq 1 ]] || remote_only="false"
+    [[ "${ASYNC_VERIFY:-0}" -eq 1 ]] && async_verify="true"
     # dual-run check only meaningful when local draft still runs.
     if [[ "$remote_only" == "true" ]]; then
       dual_check="false"
+    else
+      # async verify requires remote-only.
+      async_verify="false"
     fi
-    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_remote_only":%s,"disagg_dflash_dual_run_check":%s}' \
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_remote_only":%s,"disagg_dflash_dual_run_check":%s,"disagg_dflash_async_verify":%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)" \
-      "$DRAFT_ADDR" "$remote_only" "$dual_check"
+      "$DRAFT_ADDR" "$remote_only" "$dual_check" "$async_verify"
   else
     printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)"
@@ -900,6 +922,7 @@ while [[ $# -gt 0 ]]; do
     --hs-nixl-sink) HS_NIXL_SINK=1; shift ;;
     --no-remote-only) REMOTE_ONLY=0; shift ;;
     --dual-run-check) DUAL_RUN_CHECK=1; shift ;;
+    --async-verify) ASYNC_VERIFY=1; shift ;;
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
     --no-synthetic) USE_SYNTHETIC=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;

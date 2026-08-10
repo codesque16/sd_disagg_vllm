@@ -253,6 +253,12 @@ class Executor(ABC):
         output: list[DraftTokenIds] = self.collective_rpc("take_draft_token_ids")
         return output[0]
 
+    def poll_async_remote_drafts(self) -> DraftTokenIds | None:
+        output: list[DraftTokenIds | None] = self.collective_rpc(
+            "poll_async_remote_drafts"
+        )
+        return output[0]
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.collective_rpc("profile", args=(is_start, profile_prefix))
 

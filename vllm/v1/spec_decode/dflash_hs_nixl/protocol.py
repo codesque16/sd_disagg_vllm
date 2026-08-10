@@ -95,6 +95,8 @@ def encode_speculate_request(
     seeds: torch.Tensor | np.ndarray,
     num_scheduled_tokens: np.ndarray | torch.Tensor,
     seq_lens_cpu_upper_bound: torch.Tensor | np.ndarray,
+    verify_step: int = 0,
+    kick_iter: int = 0,
 ) -> list[bytes]:
     """Pack SPECulate meta from host tensors/ndarray. Hiddens stay on NIXL.
 
@@ -122,6 +124,8 @@ def encode_speculate_request(
         "num_ctx_tokens": int(num_ctx_tokens),
         "num_speculative_tokens": int(num_speculative_tokens),
         "num_reqs": len(req_ids),
+        "verify_step": int(verify_step),
+        "kick_iter": int(kick_iter),
         "tensors": [_tensor_frame_meta(n, t) for n, t in tensors.items()],
     }
     frames = [json.dumps(header).encode("utf-8")]

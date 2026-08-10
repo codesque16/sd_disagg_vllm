@@ -259,6 +259,29 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # NVTX / trace: scheduler step id and draft readiness at batch-prepare time.
+    # schedule_step is Scheduler.current_step after increment for this call.
+    # draft_ready_* counts running reqs with non-empty spec_token_ids (prompt
+    # done) before the schedule loop consumes them. draft_blocked_* counts
+    # async-verify reqs waiting on remote drafts. scheduled_draft_* is what
+    # actually landed in scheduled_spec_decode_tokens this step.
+    schedule_step: int = 0
+    num_draft_ready_reqs: int = 0
+    num_draft_ready_tokens: int = 0
+    num_draft_blocked_reqs: int = 0
+    num_scheduled_draft_reqs: int = 0
+    num_scheduled_draft_tokens: int = 0
+
+    # Spec-decode outcome of the *previous* completed verify step (from
+    # update_from_output). Used on the next execute NVTX annotation so nsys
+    # shows draft readiness and recent acceptance together. Zero when the
+    # prior step had no scheduled draft tokens.
+    prev_spec_schedule_step: int = 0
+    prev_spec_num_drafts: int = 0
+    prev_spec_draft_tokens: int = 0
+    prev_spec_accepted_tokens: int = 0
+    prev_spec_rejected_tokens: int = 0
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

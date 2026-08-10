@@ -979,6 +979,44 @@ class Worker(WorkerBase):
 
         iteration_details = compute_iteration_details(scheduler_output)
 
+        schedule_step = int(getattr(scheduler_output, "schedule_step", 0) or 0)
+        draft_ready_reqs = int(
+            getattr(scheduler_output, "num_draft_ready_reqs", 0) or 0
+        )
+        draft_ready_tokens = int(
+            getattr(scheduler_output, "num_draft_ready_tokens", 0) or 0
+        )
+        draft_blocked_reqs = int(
+            getattr(scheduler_output, "num_draft_blocked_reqs", 0) or 0
+        )
+        sched_draft_reqs = int(
+            getattr(scheduler_output, "num_scheduled_draft_reqs", 0) or 0
+        )
+        sched_draft_tokens = int(
+            getattr(scheduler_output, "num_scheduled_draft_tokens", 0) or 0
+        )
+        prev_spec_step = int(
+            getattr(scheduler_output, "prev_spec_schedule_step", 0) or 0
+        )
+        prev_spec_drafts = int(getattr(scheduler_output, "prev_spec_num_drafts", 0) or 0)
+        prev_spec_draft = int(
+            getattr(scheduler_output, "prev_spec_draft_tokens", 0) or 0
+        )
+        prev_spec_acc = int(
+            getattr(scheduler_output, "prev_spec_accepted_tokens", 0) or 0
+        )
+        prev_spec_rej = int(
+            getattr(scheduler_output, "prev_spec_rejected_tokens", 0) or 0
+        )
+        draft_suffix = (
+            f"_draft_ready_{draft_ready_reqs}({draft_ready_tokens})"
+            f"_blocked_{draft_blocked_reqs}"
+            f"_sched_{sched_draft_reqs}({sched_draft_tokens})"
+            f"_prev_i{prev_spec_step}"
+            f"_acc_{prev_spec_acc}_rej_{prev_spec_rej}"
+            f"_draft_{prev_spec_draft}_n{prev_spec_drafts}"
+        )
+
         if self.vllm_config.profiler_config.detailed_trace_annotation:
             # Compute roofline-model metrics per request, split by phase
             # (context vs generation). These help estimate compute and
@@ -1037,7 +1075,9 @@ class Worker(WorkerBase):
                     gen_qk_compute += query_len * seq_len
             annotation = "".join(
                 [
-                    "execute_",
+                    "i",
+                    str(schedule_step),
+                    "_execute_",
                     str(total_scheduled_tokens),
                     "_context_",
                     str(iteration_details.num_ctx_requests),
@@ -1060,12 +1100,15 @@ class Worker(WorkerBase):
                     "sqsk",
                     str(gen_qk_compute),
                     ")",
+                    draft_suffix,
                 ]
             )
         else:
             annotation = "".join(
                 [
-                    "execute_context_",
+                    "i",
+                    str(schedule_step),
+                    "_execute_context_",
                     str(iteration_details.num_ctx_requests),
                     "(",
                     str(iteration_details.num_ctx_tokens),
@@ -1075,6 +1118,7 @@ class Worker(WorkerBase):
                     "(",
                     str(iteration_details.num_generation_tokens),
                     ")",
+                    draft_suffix,
                 ]
             )
         return self.profiler.annotate_context_manager(annotation)
@@ -1180,6 +1224,11 @@ class Worker(WorkerBase):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
+
+    def poll_async_remote_drafts(self) -> DraftTokenIds | None:
+        if hasattr(self.model_runner, "poll_async_remote_drafts"):
+            return self.model_runner.poll_async_remote_drafts()
+        return None
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled

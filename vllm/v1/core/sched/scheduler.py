@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
+
+import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -239,6 +242,14 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # Milestone-4 async remote verify: never pad decode with [-1]*K and
+        # never schedule decode-1 while waiting on GPU1 drafts. Only schedule
+        # SD when request.spec_token_ids holds real draft ids; prefills of
+        # newly arrived requests remain eligible while others wait.
+        self.disagg_dflash_async_verify = bool(
+            speculative_config is not None
+            and getattr(speculative_config, "disagg_dflash_async_verify", False)
+        )
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -291,6 +302,23 @@ class Scheduler(SchedulerInterface):
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
+        # Last completed verify step's acceptance (set in update_from_output).
+        # Surfaced on the next SchedulerOutput for NVTX / debugging.
+        self._prev_spec_schedule_step = 0
+        self._prev_spec_num_drafts = 0
+        self._prev_spec_draft_tokens = 0
+        self._prev_spec_accepted_tokens = 0
+        self._prev_spec_rejected_tokens = 0
+        env_log_specdec = os.environ.get("VLLM_LOG_SPECDEC_STEP", "") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+        self._log_specdec_step = bool(
+            getattr(self.observability_config, "log_specdec_step", False)
+            or env_log_specdec
+        )
         # DP prefill balancing: Flag to track whether the last cadence-aligned
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
@@ -458,6 +486,32 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Draft readiness *before* the schedule loop consumes spec_token_ids.
+        num_draft_ready_reqs = 0
+        num_draft_ready_tokens = 0
+        num_draft_blocked_reqs = 0
+        if self.num_spec_tokens > 0:
+            for request in self.running:
+                if request.num_computed_tokens < request.num_prompt_tokens:
+                    continue
+                n_draft = (
+                    len(request.spec_token_ids) if request.spec_token_ids else 0
+                )
+                if n_draft > 0:
+                    num_draft_ready_reqs += 1
+                    num_draft_ready_tokens += n_draft
+                elif self.disagg_dflash_async_verify:
+                    num_draft_blocked_reqs += 1
+
+        try:
+            torch.cuda.nvtx.mark(
+                f"schedule_i{self.current_step}"
+                f"_ready_{num_draft_ready_reqs}({num_draft_ready_tokens})"
+                f"_blocked_{num_draft_blocked_reqs}"
+            )
+        except Exception:
+            pass
+
         self.kv_cache_manager.new_step_starts()
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
@@ -496,6 +550,19 @@ class Scheduler(SchedulerInterface):
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
+                req_index += 1
+                continue
+
+            # Async remote verify: after prompt is fully computed, never fall
+            # back to decode-1. Wait until poll publishes real draft ids.
+            # (Do not use is_prefill_chunk here — async placeholders keep it
+            # true after the last prefill chunk.) Waiting-queue prefills of
+            # other requests still run below.
+            if (
+                self.disagg_dflash_async_verify
+                and not request.spec_token_ids
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
                 req_index += 1
                 continue
 
@@ -843,11 +910,14 @@ class Scheduler(SchedulerInterface):
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
+                    # Not for async remote verify: drafts must be real ids, not
+                    # [-1] padding (otherwise prepare_inputs would read stale GPU).
                     if (
                         (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
+                        and not self.disagg_dflash_async_verify
                     ):
                         num_new_tokens = 1 + self.num_spec_tokens
                         if (
@@ -1145,6 +1215,19 @@ class Scheduler(SchedulerInterface):
                 scheduled_encoder_inputs
             )
 
+        num_scheduled_draft_reqs = len(scheduled_spec_decode_tokens)
+        num_scheduled_draft_tokens = sum(
+            len(v) for v in scheduled_spec_decode_tokens.values()
+        )
+        try:
+            torch.cuda.nvtx.mark(
+                f"schedule_i{self.current_step}"
+                f"_sched_draft_{num_scheduled_draft_reqs}"
+                f"({num_scheduled_draft_tokens})"
+            )
+        except Exception:
+            pass
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1164,6 +1247,17 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             kv_cache_block_copies=pending_kv_cache_block_copies,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            schedule_step=self.current_step,
+            num_draft_ready_reqs=num_draft_ready_reqs,
+            num_draft_ready_tokens=num_draft_ready_tokens,
+            num_draft_blocked_reqs=num_draft_blocked_reqs,
+            num_scheduled_draft_reqs=num_scheduled_draft_reqs,
+            num_scheduled_draft_tokens=num_scheduled_draft_tokens,
+            prev_spec_schedule_step=self._prev_spec_schedule_step,
+            prev_spec_num_drafts=self._prev_spec_num_drafts,
+            prev_spec_draft_tokens=self._prev_spec_draft_tokens,
+            prev_spec_accepted_tokens=self._prev_spec_accepted_tokens,
+            prev_spec_rejected_tokens=self._prev_spec_rejected_tokens,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1612,6 +1706,13 @@ class Scheduler(SchedulerInterface):
 
         outputs: dict[int, list[EngineCoreOutput]] = defaultdict(list)
         spec_decoding_stats: SpecDecodingStats | None = None
+        # Per-step acceptance totals (real rejection sampling, not synthetic).
+        # Always accumulated so NVTX / next-execute annotation work even when
+        # log_stats is off (SpecDecodingStats interval logging stays gated).
+        step_spec_num_drafts = 0
+        step_spec_draft_tokens = 0
+        step_spec_accepted_tokens = 0
+        step_spec_rejected_tokens = 0
 
         failed_kv_load_req_ids = None
         if kv_connector_output and kv_connector_output.invalid_block_ids:
@@ -1686,6 +1787,10 @@ class Scheduler(SchedulerInterface):
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
                 num_rejected = num_draft_tokens - num_accepted
+                step_spec_num_drafts += 1
+                step_spec_draft_tokens += num_draft_tokens
+                step_spec_accepted_tokens += num_accepted
+                step_spec_rejected_tokens += num_rejected
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1942,6 +2047,53 @@ class Scheduler(SchedulerInterface):
                     )
             finished_req_ids.clear()
 
+        # Record acceptance for NVTX / next-execute annotation. This path is
+        # the same real rejection-sampler outcome used for SpecDecodingStats
+        # (works for non-synthetic acceptance).
+        self._prev_spec_schedule_step = int(
+            getattr(scheduler_output, "schedule_step", 0) or 0
+        )
+        self._prev_spec_num_drafts = step_spec_num_drafts
+        self._prev_spec_draft_tokens = step_spec_draft_tokens
+        self._prev_spec_accepted_tokens = step_spec_accepted_tokens
+        self._prev_spec_rejected_tokens = step_spec_rejected_tokens
+        if step_spec_draft_tokens > 0:
+            mal = 1.0 + (
+                step_spec_accepted_tokens / step_spec_num_drafts
+                if step_spec_num_drafts > 0
+                else 0.0
+            )
+            acc_rate = (
+                100.0 * step_spec_accepted_tokens / step_spec_draft_tokens
+                if step_spec_draft_tokens > 0
+                else 0.0
+            )
+            try:
+                torch.cuda.nvtx.mark(
+                    f"specdec_i{self._prev_spec_schedule_step}"
+                    f"_drafts_{step_spec_num_drafts}"
+                    f"_draft_{step_spec_draft_tokens}"
+                    f"_acc_{step_spec_accepted_tokens}"
+                    f"_rej_{step_spec_rejected_tokens}"
+                    f"_mal_{mal:.2f}"
+                    f"_rate_{acc_rate:.1f}"
+                )
+            except Exception:
+                pass
+            if self._log_specdec_step:
+                logger.info(
+                    "SpecDec step i%d: drafts=%d draft_tokens=%d accepted=%d "
+                    "rejected=%d mean_acceptance_length=%.2f "
+                    "draft_acceptance_rate=%.1f%%",
+                    self._prev_spec_schedule_step,
+                    step_spec_num_drafts,
+                    step_spec_draft_tokens,
+                    step_spec_accepted_tokens,
+                    step_spec_rejected_tokens,
+                    mal,
+                    acc_rate,
+                )
+
         if (
             stats := self.make_stats(
                 spec_decoding_stats,
@@ -2064,8 +2216,16 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
-            if request.is_prefill_chunk:
-                # Ignore draft tokens for prefill chunks.
+            # Ignore drafts while still chunk-prefilling the prompt.
+            # Async remote verify: after the prompt is fully computed,
+            # is_prefill_chunk can remain True because async placeholders keep
+            # num_computed < num_tokens + placeholders until the next schedule.
+            # Dropping drafts there deadlocks (schedule waits on specs forever).
+            still_prefilling = request.is_prefill_chunk and not (
+                self.disagg_dflash_async_verify
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            )
+            if still_prefilling:
                 if request.spec_token_ids:
                     request.spec_token_ids = []
                 continue

@@ -78,6 +78,7 @@ class HsNixlSink:
         self._agent = _make_agent(_DRAFT_AGENT_NAME)
         self._staging: torch.Tensor | None = None
         self._reg: Any = None
+        self._speculate_iter: int = 0
         self._max_tokens = 0
         self._hidden_size = 0
         self._dtype = torch.bfloat16
@@ -175,11 +176,18 @@ class HsNixlSink:
             self._sock.send_multipart([identity, json.dumps(err).encode("utf-8")])
             return
         header, tensors = decode_speculate_request(frames)
+        self._speculate_iter += 1
+        si = self._speculate_iter
+        vi = int(header.get("verify_step", 0) or 0)
+        ki = int(header.get("kick_iter", 0) or 0)
+        n_reqs = len(header.get("req_ids", []))
+        nvtx_suffix = f"_si{si}_vi{vi}_ki{ki}_n{n_reqs}"
+        self._draft_runner._nvtx_suffix = nvtx_suffix
 
         def _wait_hiddens_ready() -> None:
             # Probe sends SPECulate meta first, then PtoP, then HS_READY.
             # CPU prep above overlaps the transfer; block here before touching HS.
-            torch.cuda.nvtx.range_push("dflash_sink_hs_wait")
+            torch.cuda.nvtx.range_push(f"dflash_sink_hs_wait{nvtx_suffix}")
             try:
                 ready = self._sock.recv_multipart()
                 if len(ready) < 2:
@@ -189,7 +197,7 @@ class HsNixlSink:
             finally:
                 torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate")
+        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_speculate{nvtx_suffix}")
         try:
             draft_tokens = self._draft_runner.speculate(
                 req_ids=list(header["req_ids"]),

@@ -251,6 +251,13 @@ class SpeculativeConfig:
     only the aux-HS ``fc`` projector (C1), kicks SPECulate to the sink, blocks
     on ZMQ draft tokens, and uses those for serving."""
 
+    disagg_dflash_async_verify: bool = False
+    """If True (requires ``disagg_dflash_remote_only``), propose kicks the sink
+    SPECulate without waiting. Draft token ids are published to the scheduler
+    as real ``request.spec_token_ids`` when the ZMQ reply arrives; the
+    AsyncScheduler does not plant ``[-1]*K`` placeholders. Until ready, the
+    request is scheduled decode-1 (no speculative slots)."""
+
     disagg_dflash_dual_run_check: bool = False
     """If True (dual-run only), after receiving remote draft tokens compare
     them to the local draft (``torch.equal``). Off by default — the compare
@@ -1303,6 +1310,10 @@ class SpeculativeConfig:
             raise ValueError(
                 "disagg_dflash_remote_only requires disagg_dflash_address "
                 "(HS NIXL sink with draft enabled)."
+            )
+        if self.disagg_dflash_async_verify and not self.disagg_dflash_remote_only:
+            raise ValueError(
+                "disagg_dflash_async_verify requires disagg_dflash_remote_only=True."
             )
         return self
 

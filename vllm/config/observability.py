@@ -76,6 +76,12 @@ class ObservabilityConfig:
     This includes number of context/generation requests and tokens
     and the elapsed cpu time for the iteration."""
 
+    log_specdec_step: bool = False
+    """Log per-step speculative decoding acceptance (drafted / accepted /
+    rejected tokens and mean acceptance length) at INFO. Useful to confirm
+    real (non-synthetic) rejection sampling is working. Also enabled when
+    ``VLLM_LOG_SPECDEC_STEP`` is set."""
+
     jit_monitor_mode: Literal["warn", "error"] = "warn"
     """How to handle post-warmup JIT compilation events."""
 

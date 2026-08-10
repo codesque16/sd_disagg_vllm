@@ -225,6 +225,11 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        spec_cfg = vllm_config.speculative_config
+        self.disagg_dflash_async_verify = bool(
+            spec_cfg is not None
+            and getattr(spec_cfg, "disagg_dflash_async_verify", False)
+        )
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -584,7 +589,18 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # Publish ready remote drafts before scheduling so decode can run
+        # 1+K (never decode-1 while waiting on GPU1).
+        self._poll_async_remote_drafts()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        # All decodes draft-blocked and no new prefills: skip empty execute
+        # unless the worker still needs bookkeeping (finished/preempted frees).
+        # Skipping those leaks req_states slots → "No free indices".
+        if (
+            scheduler_output.total_num_scheduled_tokens == 0
+            and not self._scheduler_output_needs_worker(scheduler_output)
+        ):
+            return {}, False
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -605,11 +621,38 @@ class EngineCore:
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    def _poll_async_remote_drafts(self) -> None:
+        """Install ready async remote drafts into request.spec_token_ids."""
+        if not self.disagg_dflash_async_verify:
+            return
+        draft_token_ids = self.model_executor.poll_async_remote_drafts()
+        if draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    @staticmethod
+    def _scheduler_output_needs_worker(scheduler_output: SchedulerOutput) -> bool:
+        """True if an otherwise-empty schedule still must hit the worker.
+
+        ``schedule()`` clears ``finished_req_ids`` into the output; if we skip
+        ``execute_model``, those frees never run and req_states slots leak.
+        """
+        if scheduler_output.finished_req_ids:
+            return True
+        if scheduler_output.preempted_req_ids:
+            return True
+        if scheduler_output.free_encoder_mm_hashes:
+            return True
+        return False
+
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+        # Async remote verify: always poll (even when idle waiting on drafts
+        # with no execute) so the next schedule can unblock 1+K.
+        if self.disagg_dflash_async_verify:
+            self._poll_async_remote_drafts()
+        elif self.check_for_draft_tokens and not self.async_scheduling and model_executed:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
@@ -642,41 +685,51 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            self._poll_async_remote_drafts()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
+            skip_empty = (
+                self.disagg_dflash_async_verify
+                and scheduler_output.total_num_scheduled_tokens == 0
+                and not self._scheduler_output_needs_worker(scheduler_output)
+            )
+            if skip_empty:
+                # Draft-blocked only: no tokens and no worker frees to apply.
+                if not batch_queue:
+                    return None, False
             else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                if self.is_ec_consumer:
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, model_executed
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled / bookkeeping-only).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # Defer sampling until prior-step model output is processed.
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()
+                    ):
+                        # Don't block on next worker response unless the queue is full
+                        # or there are no more requests to schedule.
+                        return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
