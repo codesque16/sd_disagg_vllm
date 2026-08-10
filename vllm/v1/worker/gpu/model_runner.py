@@ -1602,20 +1602,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._async_draft_side_queue = side_queue
         spec = self.speculator
         if spec is not None and hasattr(spec, "set_async_draft_side_channel"):
-
-            def _install(req_ids, idx_mapping, draft_tokens, draft_tokens_cpu) -> None:
-                del req_ids, draft_tokens_cpu
-                self.req_states.draft_tokens[idx_mapping].copy_(
-                    draft_tokens, non_blocking=True
-                )
-
-            spec.set_async_draft_side_channel(side_queue, install_fn=_install)
+            # GPU install is done on the worker poll path (execute stream), not
+            # from the bg xfer callback.
+            spec.set_async_draft_side_channel(side_queue)
 
     def poll_async_remote_drafts(self) -> DraftTokenIds | None:
         """Install ready async remote drafts into req_states and return CPU ids.
 
         Drains the speculator ready-queue fully (catchup-before-kick can stash
         more than one SPECulate reply before the engine polls).
+
+        H2D must use ``buf[idx] = src`` (setitem). Advanced-index getitem returns
+        a copy, so ``buf[idx].copy_(src)`` never mutates ``req_states.draft_tokens``
+        and previously drove acceptance to 0%.
         """
         if self.speculator is None or not hasattr(
             self.speculator, "poll_async_remote_drafts"
@@ -1627,13 +1626,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ready = self.speculator.poll_async_remote_drafts()
             if ready is None:
                 break
-            req_ids, idx_mapping, draft_tokens, draft_tokens_cpu = ready
-            # Non-blocking install: H2D was already enqueued without stream sync.
-            self.req_states.draft_tokens[idx_mapping].copy_(
-                draft_tokens, non_blocking=True
+            req_ids, idx_mapping, draft_tokens_cpu = ready
+            idx = idx_mapping
+            if idx.device.type != "cpu":
+                idx = idx.detach().to(device="cpu")
+            src = draft_tokens_cpu.to(
+                device=self.req_states.draft_tokens.device,
+                dtype=self.req_states.draft_tokens.dtype,
+                non_blocking=True,
             )
+            self.req_states.draft_tokens[idx] = src
             all_req_ids.extend(req_ids)
-            # CPU ids come from the ZMQ host tensor — never DtoH on the poll path.
             all_draft_ids.extend(draft_tokens_cpu.tolist())
         if not all_req_ids:
             return None

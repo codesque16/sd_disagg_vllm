@@ -72,7 +72,7 @@ CUDA events (not buffers, but part of the HS lifetime):
 |------|------------|----------|
 | **T_engine** | EngineCore process / busy loop | Poll CPU_7 → update CPU_8 → schedule → submit execute/sample. |
 | **T_exec** | Worker execute / RPC thread | `execute_model` (target forward), `finish_requests`, `sample_tokens` → `propose` kick. |
-| **T_xfer** | `dflash-hs-nixl-xfer` daemon thread | Meta DtoH → SPECulate send → stage GPU:0_1→GPU:0_2 → NIXL → HS_READY → recv reply → callback (stash/install/CPU_7). |
+| **T_xfer** | `dflash-hs-nixl-xfer` daemon thread | Meta DtoH → SPECulate send → stage GPU:0_1→GPU:0_2 → NIXL → HS_READY → recv reply → stash + put CPU_7 (no GPU:0_4 install). |
 | **T_sink** | Sink process (`DFlashHsNixlSink`) | ROUTER: SPECulate prep ∥ wait HS_READY → draft on GPU:1 → reply. |
 | **T_nixl** | NIXL progress thread(s) inside agent | Drive PtoP completion (internal). |
 
@@ -123,10 +123,12 @@ T_xfer (overlaps next T_exec / T_engine work):              T_sink:
   NIXL WRITE GPU:0_2 → GPU:1_1                                 generate on GPU:1_*
   send CPU_4 (HS_READY)                                        send CPU_5 (drafts)
   recv CPU_5
-  stash → GPU:0_3 + CPU_6; install GPU:0_4; put CPU_7
+  stash → GPU:0_3 + CPU_6; put CPU_7 (peek only — leave queue)
     │
     ▼
-T_engine:  get CPU_7 → CPU_8 → schedule decode with real drafts
+T_engine:  get CPU_7 → CPU_8
+           RPC poll → T_exec installs GPU:0_4 on execute stream
+           → schedule decode with real drafts
 ```
 
 ---
@@ -143,7 +145,8 @@ T_engine:  get CPU_7 → CPU_8 → schedule decode with real drafts
 │ writes GPU:0_1           │       │      │ stages GPU:0_1→GPU:0_2  │
 │ waits Event before write │◄──────┼──────┤ sets Event after stage  │
 │ catchup may join T_xfer  │       │      │ NIXL, ZMQ, callback     │
-│ deferred FREE bookkeep   │       │      │ puts CPU_7, installs    │
+│ deferred FREE bookkeep   │       │      │ puts CPU_7 (CPU only)   │
+│ poll installs GPU:0_4    │       │      │                         │
 └────────────┬─────────────┘       │      └───────────┬─────────────┘
              │ kick / host meta    │                  │ CPU_3/4/5 (ZMQ)
              │                     │                  ▼
@@ -167,6 +170,7 @@ T_engine:  get CPU_7 → CPU_8 → schedule decode with real drafts
 3. ZMQ DEALER is **1-deep**: no new SPECulate until prior reply is finished (or drained). Catchup-before-kick enforces this on `T_exec` when needed.
 4. **FREE** must not interleave with an in-flight SPECulate on the socket. If busy, ids go to `_async_deferred_free_ids` and flush when idle (poll/catchup) — not via `Thread.join` at execute start.
 5. **CPU_8** empty ⇒ do not schedule decode for that req (wait-for-drafts). No decode-1 fallback.
+6. **GPU:0_4** must be installed on **T_exec** (RPC poll), not T_xfer. Verify reads `req_states.draft_tokens` on the execute stream; a bg-thread H2D is not ordered against that and yielded 0% acceptance.
 
 ---
 
