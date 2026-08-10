@@ -126,9 +126,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._async_pending_req_ids: list[str] | None = None
         self._async_pending_idx_mapping: torch.Tensor | None = None
         self._async_pending_num_reqs: int = 0
-        # Each entry: (req_ids, idx_mapping, draft_tokens_cpu).
-        # GPU H2D into req_states happens on the worker poll/execute thread —
-        # never on the bg xfer thread (cross-stream race → 0% acceptance).
+        # Fallback only when there is no side channel: (req_ids, idx, draft_cpu).
+        # With a side channel, stash publishes CPU ids only; prepare_inputs H2Ds.
         self._async_ready_queue: list[
             tuple[list[str], torch.Tensor, torch.Tensor]
         ] = []
@@ -849,16 +848,14 @@ class DFlashSpeculator(DraftModelSpeculator):
             torch.cuda.nvtx.range_pop()
 
     def _on_async_speculate_reply(self, remote: torch.Tensor) -> None:
-        """Bg-thread callback: stash drafts and publish CPU ids to the engine.
+        """Bg-thread callback: stash CPU drafts (side-channel publish is in stash).
 
         Do **not** install into ``req_states.draft_tokens`` here. The bg thread
         has a different CUDA default stream than the worker execute thread; a
         non-blocking H2D on this stream is not ordered against verify's
         ``combine_sampled_and_draft_tokens``, which produced 0% acceptance.
         GPU install stays on ``poll_async_remote_drafts`` (worker RPC thread).
-        Leave the ready-queue entry for that poll; only peek for side-channel CPU.
         """
-        side_payload: tuple[list[str], list[list[int]]] | None = None
         with self._async_lock:
             req_ids = self._async_pending_req_ids
             idx_mapping = self._async_pending_idx_mapping
@@ -887,25 +884,30 @@ class DFlashSpeculator(DraftModelSpeculator):
                     remote=remote,
                     already_locked=True,
                 )
-            if not self._async_ready_queue or self._async_draft_side_queue is None:
-                return
-            # Peek — worker poll pops and installs on the execute stream.
-            req_ids, _idx, remote_cpu = self._async_ready_queue[-1]
-            side_payload = (list(req_ids), remote_cpu.tolist())
 
+    def _publish_async_draft_side(
+        self, req_ids: list[str], draft_ids: list[list[int]]
+    ) -> bool:
+        """Wake the engine with CPU draft ids. Returns True if enqueued.
+
+        Blocks if the queue is full so the wake is never dropped.
+        """
         side_q = self._async_draft_side_queue
-        if side_q is None or side_payload is None:
-            return
+        if side_q is None:
+            return False
+        payload = (list(req_ids), draft_ids)
         try:
-            side_q.put_nowait(side_payload)
+            side_q.put_nowait(payload)
+            return True
         except Exception:
             try:
-                side_q.put(side_payload, timeout=0.01)
+                side_q.put(payload)
+                return True
             except Exception:
-                logger.warning(
-                    "DFlash async: side-channel publish failed; "
-                    "worker RPC poll will still install drafts"
+                logger.exception(
+                    "DFlash async: side-channel publish failed after stash"
                 )
+                return False
 
     def _stash_async_ready_drafts(
         self,
@@ -915,14 +917,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         remote: torch.Tensor,
         already_locked: bool = False,
     ) -> None:
-        """Validate ZMQ drafts and enqueue host copies for worker-thread GPU install.
+        """Validate ZMQ drafts and wake the engine with CPU ids.
 
-        Only CPU tensors are stashed here. H2D into ``req_states.draft_tokens``
-        must run on the worker RPC/execute thread (see ``poll_async_remote_drafts``);
-        doing it on the bg xfer stream raced verify and produced 0% acceptance.
+        With a side channel: publish only (no ready-queue / no CUDA). The
+        scheduler gets real ``spec_token_ids``; ``prepare_inputs`` H2Ds them on
+        the execute stream. That keeps engine schedule overlapped with the
+        prior GPU batch (no poll-time ``cudaStreamSynchronize``).
+
+        Without a side channel: enqueue CPU drafts for a CUDA-free RPC poll.
         """
 
+        publish: tuple[list[str], list[list[int]]] | None = None
+
         def _do() -> None:
+            nonlocal publish
             num_reqs = len(req_ids)
             if (
                 remote.shape[0] != num_reqs
@@ -933,7 +941,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                     f"{tuple(remote.shape)} (expected ({num_reqs}, "
                     f"{self.num_speculative_steps}))"
                 )
-            # Wire decode yields a CPU tensor; own it for the scheduler tolist path.
             if remote.device.type != "cpu":
                 remote_cpu = remote.detach().to(
                     dtype=self.draft_tokens.dtype, device="cpu"
@@ -943,23 +950,27 @@ class DFlashSpeculator(DraftModelSpeculator):
                     dtype=self.draft_tokens.dtype
                 ).contiguous()
 
-            # Clone idx_mapping onto CPU so the worker poll thread can index safely
-            # without depending on tensors created under another thread's context.
             if idx_mapping.device.type != "cpu":
                 idx_host = idx_mapping.detach().to(device="cpu").contiguous()
             else:
                 idx_host = idx_mapping.detach().contiguous()
 
-            self._async_ready_queue.append((req_ids, idx_host, remote_cpu))
             self._async_pending_req_ids = None
             self._async_pending_idx_mapping = None
             self._async_pending_num_reqs = 0
+            publish = (list(req_ids), remote_cpu.tolist())
+            # Ready queue only when there is no side channel (poll fallback).
+            if self._async_draft_side_queue is None:
+                self._async_ready_queue.append((req_ids, idx_host, remote_cpu))
 
         if already_locked:
             _do()
         else:
             with self._async_lock:
                 _do()
+        if publish is not None and self._async_draft_side_queue is not None:
+            # Blocking put inside publish — must not fail under normal load.
+            self._publish_async_draft_side(publish[0], publish[1])
 
     def _resolve_async_remote_drafts(self, *, blocking: bool) -> bool:
         """Try to complete an in-flight async SPECulate. Returns True if idle for kick.

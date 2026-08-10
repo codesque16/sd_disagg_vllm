@@ -170,7 +170,8 @@ T_engine:  get CPU_7 → CPU_8
 3. ZMQ DEALER is **1-deep**: no new SPECulate until prior reply is finished (or drained). Catchup-before-kick enforces this on `T_exec` when needed.
 4. **FREE** must not interleave with an in-flight SPECulate on the socket. If busy, ids go to `_async_deferred_free_ids` and flush when idle (poll/catchup) — not via `Thread.join` at execute start.
 5. **CPU_8** empty ⇒ do not schedule decode for that req (wait-for-drafts). No decode-1 fallback.
-6. **GPU:0_4** must be installed on **T_exec** (RPC poll), not T_xfer. Verify reads `req_states.draft_tokens` on the execute stream; a bg-thread H2D is not ordered against that and yielded 0% acceptance.
+6. **GPU:0_4** is installed in **prepare_inputs** from scheduled real draft ids (execute stream), not on the engine poll RPC and not on T_xfer. Poll/side-channel stay CPU-only so next-batch schedule can overlap prior GPU execute.
+7. Every stash publishes **CPU_7**. Engine drains side channel only (no CUDA poll) when the side channel exists.
 
 ---
 

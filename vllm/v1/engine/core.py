@@ -18,6 +18,7 @@ from multiprocessing.queues import Queue
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -622,23 +623,31 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def _poll_async_remote_drafts(self) -> None:
-        """Install ready async remote drafts into request.spec_token_ids.
+        """Publish ready async remote drafts into request.spec_token_ids.
 
-        Side channel carries CPU draft ids for the scheduler (wake without
-        waiting on a stuck worker RPC). Worker ``poll_async_remote_drafts``
-        must still run to install GPU ``req_states.draft_tokens`` on the
-        execute stream — skipping that left verify reading stale drafts and
-        drove acceptance to 0%.
+        Side channel carries CPU draft ids for the scheduler without a worker
+        RPC. GPU ``req_states.draft_tokens`` are installed later in
+        ``prepare_inputs`` from those scheduled ids (execute stream) so this
+        path must not CUDA-sync against an in-flight batch.
+
+        With a side channel: drain CPU ids only; skip worker RPC (ready queue
+        is not used on that path). Without a side channel: CUDA-free RPC poll
+        for CPU ids only.
         """
         if not self.disagg_dflash_async_verify:
             return
-        # Drain all currently published side-channel batches (CPU / scheduler).
+        got_side = False
         while True:
             draft_token_ids = self.model_executor.try_recv_async_remote_drafts()
             if draft_token_ids is None:
                 break
+            got_side = True
             self.scheduler.update_draft_token_ids(draft_token_ids)
-        # Always RPC-poll: GPU install + any batches not yet on the side channel.
+        if self.model_executor.has_async_draft_side_channel:
+            # Happy path: scheduler has real draft ids; prepare will H2D.
+            # Do not RPC-poll — that used to cudaStreamSynchronize on the
+            # worker and blocked overlapping the next schedule with GPU work.
+            return
         draft_token_ids = self.model_executor.poll_async_remote_drafts()
         if draft_token_ids is not None:
             self.scheduler.update_draft_token_ids(draft_token_ids)
@@ -710,6 +719,16 @@ class EngineCore:
                 # Draft-blocked only: no tokens and no worker frees to apply.
                 if not batch_queue:
                     return None, False
+                # Bounded wait on the oldest in-flight result: if it completes,
+                # fall through and collect (launch-before-long-sync). If not,
+                # return and retry so we can poll drafts / schedule without
+                # blocking this thread on cudaStreamSynchronize indefinitely.
+                # NOTE: Multiproc FutureWrapper.done() is false until result()
+                # drains the MQ — must use result(timeout=), not done().
+                try:
+                    batch_queue[-1][0].result(timeout=0.001)
+                except TimeoutError:
+                    return None, False
             else:
                 with self.log_error_detail(scheduler_output):
                     exec_future = self.model_executor.execute_model(
@@ -757,7 +776,12 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            # NVTX: attribute nsys CUDA API under this range (Event vs Stream).
+            torch.cuda.nvtx.range_push("engine_collect_sample_output")
+            try:
+                model_output = future.result()
+            finally:
+                torch.cuda.nvtx.range_pop()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.

@@ -81,20 +81,30 @@ class FutureWrapper(Future):
         self.futures_queue.appendleft(self)
 
     def result(self, timeout=None):
-        if timeout is not None:
-            raise RuntimeError("timeout not implemented")
-
-        # Drain any futures ahead of us in the queue.
+        # Drain any futures ahead of us in the queue. On timeout, put the
+        # in-flight future back so a later result() can retry (needed for
+        # bounded waits while draft-blocked).
+        deadline = None if timeout is None else (time.monotonic() + timeout)
         while not self.done():
+            remaining = None if deadline is None else (deadline - time.monotonic())
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError()
             future = self.futures_queue.pop()
-            future._wait_for_response()
+            try:
+                future._wait_for_response(timeout=remaining)
+            except TimeoutError:
+                self.futures_queue.append(future)
+                raise
         return super().result()
 
-    def _wait_for_response(self):
+    def _wait_for_response(self, timeout: float | None = None):
         try:
-            response = self.aggregate(self.get_response())
+            response = self.aggregate(self.get_response(timeout=timeout))
             with suppress(InvalidStateError):
                 self.set_result(response)
+        except TimeoutError:
+            # Soft timeout: leave future unfinished so result() can retry.
+            raise
         except Exception as e:
             with suppress(InvalidStateError):
                 self.set_exception(e)
@@ -414,12 +424,15 @@ class MultiprocExecutor(Executor):
         if output_rank is not None:
             response_mqs = (response_mqs[output_rank],)
 
-        def get_response():
+        def get_response(timeout: float | None = None):
             responses = []
             for mq in response_mqs:
-                dequeue_timeout = (
-                    None if deadline is None else (deadline - time.monotonic())
-                )
+                if timeout is not None:
+                    dequeue_timeout = timeout
+                elif deadline is None:
+                    dequeue_timeout = None
+                else:
+                    dequeue_timeout = deadline - time.monotonic()
                 try:
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:

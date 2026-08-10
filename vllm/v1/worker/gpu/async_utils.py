@@ -47,27 +47,36 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        # NVTX: attribute nsys CUDA API under collect (Event vs Stream sync).
+        torch.cuda.nvtx.range_push("async_output_get_output")
+        try:
+            torch.cuda.nvtx.range_push("async_output_event_sync")
+            try:
+                self.copy_event.synchronize()
+            finally:
+                torch.cuda.nvtx.range_pop()
 
-        # NOTE(woosuk): The following code is to ensure compatibility with
-        # the existing model runner.
-        # Going forward, we should keep the data structures as NumPy arrays
-        # rather than Python lists.
-        sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
-        num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
-        for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
-            del token_ids[num_tokens:]
-        self.model_runner_output.sampled_token_ids = sampled_token_ids
+            # NOTE(woosuk): The following code is to ensure compatibility with
+            # the existing model runner.
+            # Going forward, we should keep the data structures as NumPy arrays
+            # rather than Python lists.
+            sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
+            num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
+            for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
+                del token_ids[num_tokens:]
+            self.model_runner_output.sampled_token_ids = sampled_token_ids
 
-        if self.num_nans is not None:
-            self.model_runner_output.num_nans_in_logits = dict(
-                zip(self.model_runner_output.req_ids, self.num_nans.tolist())
-            )
+            if self.num_nans is not None:
+                self.model_runner_output.num_nans_in_logits = dict(
+                    zip(self.model_runner_output.req_ids, self.num_nans.tolist())
+                )
 
-        if self.logprobs_tensors is not None:
-            self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
-        self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
-        return self.model_runner_output
+            if self.logprobs_tensors is not None:
+                self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
+            self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+            return self.model_runner_output
+        finally:
+            torch.cuda.nvtx.range_pop()
 
 
 class AsyncPoolingOutput(AsyncModelRunnerOutput):
@@ -95,15 +104,23 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
             self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
-        self.copy_event.synchronize()
-        if self.is_valid_cpu is not None:
-            is_valid_cpu = self.is_valid_cpu.tolist()
-            for i, is_valid in enumerate(is_valid_cpu):
-                if not is_valid:
-                    pooler_output[i] = None
-        self.model_runner_output.pooler_output = pooler_output
-        return self.model_runner_output
+        torch.cuda.nvtx.range_push("async_pooling_output_get_output")
+        try:
+            pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
+            torch.cuda.nvtx.range_push("async_output_event_sync")
+            try:
+                self.copy_event.synchronize()
+            finally:
+                torch.cuda.nvtx.range_pop()
+            if self.is_valid_cpu is not None:
+                is_valid_cpu = self.is_valid_cpu.tolist()
+                for i, is_valid in enumerate(is_valid_cpu):
+                    if not is_valid:
+                        pooler_output[i] = None
+            self.model_runner_output.pooler_output = pooler_output
+            return self.model_runner_output
+        finally:
+            torch.cuda.nvtx.range_pop()
 
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:

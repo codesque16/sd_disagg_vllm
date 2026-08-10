@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 import queue
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from multiprocessing import Lock
@@ -30,11 +31,26 @@ class AsyncOutputFuture(Future):
         self.single_value = single_value
         super().__init__()
 
-    def result(self, timeout=None):
-        if timeout is not None:
-            raise RuntimeError("timeout not implemented")
+    def _copy_event(self) -> torch.cuda.Event | None:
+        # AsyncOutput / AsyncPoolingOutput use copy_event; V1 GPU runner
+        # wrappers use async_copy_ready_event.
+        return getattr(self.async_output, "copy_event", None) or getattr(
+            self.async_output, "async_copy_ready_event", None
+        )
 
+    def result(self, timeout=None):
         if not super().done():
+            if timeout is not None:
+                event = self._copy_event()
+                if event is None:
+                    raise RuntimeError("timeout not implemented")
+                # Soft wait for DtoH readiness without a full synchronize.
+                # Used by draft-blocked launch-before-sync (short timeout).
+                deadline = time.monotonic() + timeout
+                while not event.query():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError()
+                    time.sleep(0)
             try:
                 output = self.async_output.get_output()
                 self.set_result(output if self.single_value else [output])

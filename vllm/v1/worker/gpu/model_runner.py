@@ -192,6 +192,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         # Set by executor for async remote-verify side-channel publish.
         self._async_draft_side_queue = None
+        # Pinned host + GPU staging for async remote draft H2D on the poll path.
+        # Unpinned .to(device) inserts cudaStreamSynchronize; pinned copy_ does not.
+        self._async_draft_pin: torch.Tensor | None = None
+        self._async_draft_gpu_stage: torch.Tensor | None = None
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -968,6 +972,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
             )
+            # Async remote packs real draft IDs into scheduled_spec_decode_tokens.
+            # Install here (execute stream) so the engine poll path stays CUDA-free
+            # and can overlap next-batch CPU schedule with the prior GPU batch.
+            # Sync AsyncScheduler still uses [-1] placeholders — those are skipped.
+            self._install_scheduled_real_drafts(
+                req_ids, idx_mapping_np, draft_tokens
+            )
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
@@ -1602,19 +1613,92 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self._async_draft_side_queue = side_queue
         spec = self.speculator
         if spec is not None and hasattr(spec, "set_async_draft_side_channel"):
-            # GPU install is done on the worker poll path (execute stream), not
-            # from the bg xfer callback.
+            # GPU install is in prepare_inputs from scheduled real draft ids.
             spec.set_async_draft_side_channel(side_queue)
 
+    def _ensure_async_draft_install_bufs(self, num_reqs: int) -> None:
+        """Pinned host + GPU row staging for non-blocking draft H2D."""
+        if self.num_speculative_steps <= 0:
+            return
+        k = self.num_speculative_steps
+        dtype = self.req_states.draft_tokens.dtype
+        device = self.req_states.draft_tokens.device
+        need_pin = (
+            self._async_draft_pin is None
+            or self._async_draft_pin.shape[0] < num_reqs
+            or self._async_draft_pin.dtype != dtype
+        )
+        need_gpu = (
+            self._async_draft_gpu_stage is None
+            or self._async_draft_gpu_stage.shape[0] < num_reqs
+            or self._async_draft_gpu_stage.dtype != dtype
+            or self._async_draft_gpu_stage.device != device
+        )
+        if not need_pin and not need_gpu:
+            return
+        with torch.inference_mode(False):
+            if need_pin:
+                self._async_draft_pin = torch.empty(
+                    (self.max_num_reqs, k), dtype=dtype, pin_memory=True
+                )
+            if need_gpu:
+                self._async_draft_gpu_stage = torch.empty(
+                    (self.max_num_reqs, k), dtype=dtype, device=device
+                )
+
+    def _install_scheduled_real_drafts(
+        self,
+        req_ids: list[str],
+        idx_mapping_np: np.ndarray,
+        scheduled_drafts: dict[str, list[int]],
+    ) -> None:
+        """H2D real scheduled draft ids into ``req_states.draft_tokens``.
+
+        Runs on the execute stream at prepare time so verify sees the same ids
+        the scheduler booked. Skips ``[-1]`` placeholder schedules (sync path).
+        """
+        if self.num_speculative_steps <= 0 or not scheduled_drafts:
+            return
+        rows: list[int] = []
+        host_rows: list[list[int]] = []
+        k = self.num_speculative_steps
+        for i, req_id in enumerate(req_ids):
+            toks = scheduled_drafts.get(req_id)
+            if not toks or toks[0] < 0:
+                continue
+            padded = list(toks[:k])
+            if len(padded) < k:
+                padded.extend([-1] * (k - len(padded)))
+            rows.append(int(idx_mapping_np[i]))
+            host_rows.append(padded)
+        if not rows:
+            return
+        n = len(rows)
+        self._ensure_async_draft_install_bufs(n)
+        assert self._async_draft_pin is not None
+        assert self._async_draft_gpu_stage is not None
+        pin = self._async_draft_pin[:n]
+        gpu_stage = self._async_draft_gpu_stage[:n]
+        # Pinned H2D only — never draft_tokens[cpu_idx]=... (that inserts
+        # cudaStreamSynchronize and drains the prior execute_context on the
+        # compute stream; nsys: MemcpyAsync then long StreamSynchronize).
+        torch.cuda.nvtx.range_push("dflash_install_scheduled_drafts")
+        try:
+            host = torch.tensor(host_rows, dtype=pin.dtype)
+            pin.copy_(host)
+            gpu_stage.copy_(pin, non_blocking=True)
+            draft_buf = self.req_states.draft_tokens
+            for i, row in enumerate(rows):
+                draft_buf[row].copy_(gpu_stage[i], non_blocking=True)
+        finally:
+            torch.cuda.nvtx.range_pop()
+
     def poll_async_remote_drafts(self) -> DraftTokenIds | None:
-        """Install ready async remote drafts into req_states and return CPU ids.
+        """Drain ready async drafts and return CPU ids (no CUDA).
 
-        Drains the speculator ready-queue fully (catchup-before-kick can stash
-        more than one SPECulate reply before the engine polls).
-
-        H2D must use ``buf[idx] = src`` (setitem). Advanced-index getitem returns
-        a copy, so ``buf[idx].copy_(src)`` never mutates ``req_states.draft_tokens``
-        and previously drove acceptance to 0%.
+        GPU install is done in ``prepare_inputs`` from scheduled real draft ids
+        so this RPC never ``cudaStreamSynchronize``s against an in-flight batch
+        (keeps next-batch CPU schedule overlapped with prior GPU execute).
         """
         if self.speculator is None or not hasattr(
             self.speculator, "poll_async_remote_drafts"
@@ -1626,16 +1710,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ready = self.speculator.poll_async_remote_drafts()
             if ready is None:
                 break
-            req_ids, idx_mapping, draft_tokens_cpu = ready
-            idx = idx_mapping
-            if idx.device.type != "cpu":
-                idx = idx.detach().to(device="cpu")
-            src = draft_tokens_cpu.to(
-                device=self.req_states.draft_tokens.device,
-                dtype=self.req_states.draft_tokens.dtype,
-                non_blocking=True,
-            )
-            self.req_states.draft_tokens[idx] = src
+            req_ids, _idx_mapping, draft_tokens_cpu = ready
             all_req_ids.extend(req_ids)
             all_draft_ids.extend(draft_tokens_cpu.tolist())
         if not all_req_ids:
