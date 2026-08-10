@@ -113,6 +113,15 @@ class MultiprocExecutor(Executor):
         self._finalizer = weakref.finalize(self, self.shutdown)
         self.is_failed = False
         self.failure_callback: FailureCallback | None = None
+        # Engine←worker draft publish path (async remote verify). Created before
+        # workers spawn so both ends share the same Queue.
+        self._async_draft_side_queue: multiprocessing.Queue | None = None
+        spec_cfg = self.vllm_config.speculative_config
+        if (
+            spec_cfg is not None
+            and getattr(spec_cfg, "disagg_dflash_async_verify", False)
+        ):
+            self._async_draft_side_queue = get_mp_context().Queue(maxsize=64)
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
         assert self.world_size == tp_size * pp_size * pcp_size, (
@@ -188,6 +197,11 @@ class MultiprocExecutor(Executor):
                         shared_worker_lock=shared_worker_lock,
                         is_driver_worker=is_driver_worker,
                         inherited_fds=inherited_fds,
+                        async_draft_side_queue=(
+                            self._async_draft_side_queue
+                            if is_driver_worker
+                            else None
+                        ),
                     )
                 unready_workers.append(unready_worker_handle)
                 if inherited_fds is not None:
@@ -344,6 +358,20 @@ class MultiprocExecutor(Executor):
         return self.collective_rpc(
             "poll_async_remote_drafts", unique_reply_rank=self.output_rank
         )
+
+    def try_recv_async_remote_drafts(self) -> DraftTokenIds | None:
+        q = self._async_draft_side_queue
+        if q is None:
+            return None
+        try:
+            req_ids, draft_ids = q.get_nowait()
+        except Exception:
+            return None
+        return DraftTokenIds(req_ids, draft_ids)
+
+    @property
+    def has_async_draft_side_channel(self) -> bool:
+        return self._async_draft_side_queue is not None
 
     def collective_rpc(  # type: ignore[override]
         self,
@@ -608,6 +636,7 @@ class WorkerProc:
         input_shm_handle: Handle,
         shared_worker_lock: LockType,
         is_driver_worker: bool,
+        async_draft_side_queue: multiprocessing.Queue | None = None,
     ):
         self.rank = rank
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
@@ -641,6 +670,14 @@ class WorkerProc:
         else:
             self.worker.load_model()
 
+        if async_draft_side_queue is not None:
+            # WorkerWrapperBase.worker is the concrete Worker instance.
+            inner = getattr(self.worker, "worker", None)
+            if inner is not None and hasattr(inner, "set_async_draft_side_queue"):
+                inner.set_async_draft_side_queue(async_draft_side_queue)
+            elif hasattr(self.worker, "set_async_draft_side_queue"):
+                self.worker.set_async_draft_side_queue(async_draft_side_queue)
+
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
         if self.use_async_scheduling:
@@ -673,6 +710,7 @@ class WorkerProc:
         shared_worker_lock: LockType,
         is_driver_worker: bool,
         inherited_fds: list[int] | None = None,
+        async_draft_side_queue: multiprocessing.Queue | None = None,
     ) -> UnreadyWorkerProcHandle:
         context = get_mp_context()
         # Ready pipe to communicate readiness from child to parent
@@ -694,6 +732,7 @@ class WorkerProc:
             "is_driver_worker": is_driver_worker,
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
+            "async_draft_side_queue": async_draft_side_queue,
         }
         # Run EngineCore busy loop in background process.
         proc = context.Process(

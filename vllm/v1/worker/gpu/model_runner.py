@@ -190,6 +190,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # Set by executor for async remote-verify side-channel publish.
+        self._async_draft_side_queue = None
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -1582,6 +1584,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()
+
+    def set_async_draft_side_queue(self, side_queue) -> None:
+        """Wire engine-visible draft side channel onto the DFlash speculator."""
+        self._async_draft_side_queue = side_queue
+        spec = self.speculator
+        if spec is not None and hasattr(spec, "set_async_draft_side_channel"):
+
+            def _install(req_ids, idx_mapping, draft_tokens, draft_tokens_cpu) -> None:
+                del req_ids, draft_tokens_cpu
+                self.req_states.draft_tokens[idx_mapping].copy_(
+                    draft_tokens, non_blocking=True
+                )
+
+            spec.set_async_draft_side_channel(side_queue, install_fn=_install)
 
     def poll_async_remote_drafts(self) -> DraftTokenIds | None:
         """Install ready async remote drafts into req_states and return CPU ids.

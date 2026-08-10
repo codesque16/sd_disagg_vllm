@@ -622,8 +622,21 @@ class EngineCore:
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def _poll_async_remote_drafts(self) -> None:
-        """Install ready async remote drafts into request.spec_token_ids."""
+        """Install ready async remote drafts into request.spec_token_ids.
+
+        Prefer the worker→engine side channel (bg SPECulate recv publishes CPU
+        draft ids without waiting on the worker RPC queue). Fall back to RPC
+        poll only when no side channel is configured.
+        """
         if not self.disagg_dflash_async_verify:
+            return
+        # Drain all currently published side-channel batches.
+        while True:
+            draft_token_ids = self.model_executor.try_recv_async_remote_drafts()
+            if draft_token_ids is None:
+                break
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+        if self.model_executor.has_async_draft_side_channel:
             return
         draft_token_ids = self.model_executor.poll_async_remote_drafts()
         if draft_token_ids is not None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import queue
 from collections.abc import Callable
 from concurrent.futures import Future
 from multiprocessing import Lock
@@ -46,6 +47,13 @@ class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
+        self._async_draft_side_queue: queue.Queue | None = None
+        spec_cfg = self.vllm_config.speculative_config
+        if (
+            spec_cfg is not None
+            and getattr(spec_cfg, "disagg_dflash_async_verify", False)
+        ):
+            self._async_draft_side_queue = queue.Queue(maxsize=64)
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(
             vllm_config=self.vllm_config,
@@ -67,6 +75,10 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+        if self._async_draft_side_queue is not None:
+            inner = getattr(self.driver_worker, "worker", None)
+            if inner is not None and hasattr(inner, "set_async_draft_side_queue"):
+                inner.set_async_draft_side_queue(self._async_draft_side_queue)
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -135,6 +147,20 @@ class UniProcExecutor(Executor):
 
     def poll_async_remote_drafts(self) -> DraftTokenIds | None:
         return self.collective_rpc("poll_async_remote_drafts", single_value=True)
+
+    def try_recv_async_remote_drafts(self) -> DraftTokenIds | None:
+        q = self._async_draft_side_queue
+        if q is None:
+            return None
+        try:
+            req_ids, draft_ids = q.get_nowait()
+        except Exception:
+            return None
+        return DraftTokenIds(req_ids, draft_ids)
+
+    @property
+    def has_async_draft_side_channel(self) -> bool:
+        return self._async_draft_side_queue is not None
 
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as

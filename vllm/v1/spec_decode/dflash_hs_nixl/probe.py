@@ -8,6 +8,7 @@ import base64
 import json
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -101,6 +102,12 @@ class DFlashHsNixlProbe:
         # (async scheduling) without waiting on staging/PtoP.
         self._bg_thread: threading.Thread | None = None
         self._bg_error: BaseException | None = None
+        # Set when bg thread recv's SPECulate and no on_speculate_reply callback
+        # consumed it (sync dual-run / fallback). Guarded by `_reply_lock`.
+        self._bg_reply: torch.Tensor | None = None
+        self._reply_lock = threading.Lock()
+        # True after bg (or callback path) finished the SPECulate reply.
+        self._reply_complete = False
 
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.DEALER)
@@ -545,6 +552,7 @@ class DFlashHsNixlProbe:
         defer_meta_sync: bool = False,
         verify_step: int = 0,
         kick_iter: int = 0,
+        on_speculate_reply: Callable[[torch.Tensor], None] | None = None,
     ) -> None:
         """Kick NIXL on a side thread; return immediately.
 
@@ -556,6 +564,10 @@ class DFlashHsNixlProbe:
         enqueue or stream sync**. Bg does meta DtoH → wait → SPECulate send →
         stage/PtoP/HS_READY so ``sample_tokens`` can return and the next
         ``execute_context`` can be submitted while GPU0 still drains.
+
+        When ``on_speculate_reply`` is set (async verify), the bg thread also
+        blocking-recvs the SPECulate reply and invokes the callback so drafts
+        are stashed without waiting for the worker RPC thread to poll.
         """
         if self._bg_thread is not None or getattr(self, "_speculate_pending", False):
             raise RuntimeError(
@@ -564,10 +576,15 @@ class DFlashHsNixlProbe:
         if not self._handshook:
             self.handshake()
 
+        with self._reply_lock:
+            self._bg_reply = None
+            self._reply_complete = False
+
         hs = hidden_states
         n_ctx = int(hs.shape[0])
         num_reqs = len(req_ids)
         req_ids_list = list(req_ids)
+        reply_cb = on_speculate_reply
         # Sync path: host_meta already on pinned buffers after enqueue+sync.
         # Async path: deferred_pack carries host snapshots + GPU tensor refs;
         # bg runs _enqueue_meta_dtoh then encode/send.
@@ -756,6 +773,27 @@ class DFlashHsNixlProbe:
                         )
                     finally:
                         torch.cuda.nvtx.range_pop()
+
+                    # Async path: recv SPECulate on this thread so the worker
+                    # RPC thread (possibly stuck in execute_model) is not the
+                    # only place that can take the ZMQ reply.
+                    if defer_meta_sync:
+                        torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate_recv")
+                        try:
+                            reply_frames = self._sock.recv_multipart()
+                            remote = decode_speculate_response(reply_frames)
+                        finally:
+                            torch.cuda.nvtx.range_pop()
+                        with self._reply_lock:
+                            self._speculate_pending = False
+                            self._reply_complete = True
+                            if reply_cb is not None:
+                                # Callback stashes/publishes; do not keep a copy.
+                                self._bg_reply = None
+                            else:
+                                self._bg_reply = remote
+                        if reply_cb is not None:
+                            reply_cb(remote)
             except BaseException as e:
                 self._bg_error = e
                 if sent_speculate:
@@ -768,7 +806,11 @@ class DFlashHsNixlProbe:
                             ]
                         )
                     except Exception:
+                        pass
+                    with self._reply_lock:
                         self._speculate_pending = False
+                        self._reply_complete = True
+                        self._bg_reply = None
 
         self._bg_thread = threading.Thread(
             target=_worker, name="dflash-hs-nixl-xfer", daemon=True
@@ -806,6 +848,16 @@ class DFlashHsNixlProbe:
     def finish_speculate(self) -> torch.Tensor | None:
         """Join bg send (if any), then wait for SPECulate reply. None if draft off."""
         self._join_bg()
+        with self._reply_lock:
+            if self._bg_reply is not None:
+                remote = self._bg_reply
+                self._bg_reply = None
+                self._speculate_pending = False
+                return remote
+            if self._reply_complete:
+                # Callback path already consumed the reply.
+                self._speculate_pending = False
+                return None
         if not self.draft_enabled or not getattr(self, "_speculate_pending", False):
             self._speculate_pending = False
             return None
@@ -814,7 +866,9 @@ class DFlashHsNixlProbe:
             reply = self._sock.recv_multipart()
             return decode_speculate_response(reply)
         finally:
-            self._speculate_pending = False
+            with self._reply_lock:
+                self._speculate_pending = False
+                self._reply_complete = True
             torch.cuda.nvtx.range_pop()
 
     def try_finish_speculate(self) -> torch.Tensor | None:
@@ -822,12 +876,22 @@ class DFlashHsNixlProbe:
 
         Does not join a still-running bg transfer thread (sink only replies after
         HS_READY, so a live bg means the reply cannot be ready yet). When the bg
-        thread has exited, joins to surface transfer errors, then NOBLOCK recv.
+        thread has exited, joins to surface transfer errors, then takes a
+        bg-stashed reply or NOBLOCK recv.
         """
         t = self._bg_thread
         if t is not None and t.is_alive():
             return None
         self._join_bg()
+        with self._reply_lock:
+            if self._bg_reply is not None:
+                remote = self._bg_reply
+                self._bg_reply = None
+                self._speculate_pending = False
+                return remote
+            if self._reply_complete:
+                self._speculate_pending = False
+                return None
         if not self.draft_enabled or not getattr(self, "_speculate_pending", False):
             return None
         torch.cuda.nvtx.range_push("dflash_hs_nixl_speculate_try")
@@ -836,7 +900,9 @@ class DFlashHsNixlProbe:
                 reply = self._sock.recv_multipart(flags=zmq.NOBLOCK)
             except zmq.Again:
                 return None
-            self._speculate_pending = False
+            with self._reply_lock:
+                self._speculate_pending = False
+                self._reply_complete = True
             return decode_speculate_response(reply)
         finally:
             torch.cuda.nvtx.range_pop()

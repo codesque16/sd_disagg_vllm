@@ -259,6 +259,19 @@ class Executor(ABC):
         )
         return output[0]
 
+    def try_recv_async_remote_drafts(self) -> DraftTokenIds | None:
+        """Non-blocking read of CPU draft ids from the async side channel.
+
+        Returns drafts published by the worker bg SPECulate-recv path without
+        entering the worker RPC queue (so this works while execute_model runs).
+        Default: no side channel.
+        """
+        return None
+
+    @property
+    def has_async_draft_side_channel(self) -> bool:
+        return False
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.collective_rpc("profile", args=(is_start, profile_prefix))
 

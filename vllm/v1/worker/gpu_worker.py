@@ -1230,6 +1230,10 @@ class Worker(WorkerBase):
             return self.model_runner.poll_async_remote_drafts()
         return None
 
+    def set_async_draft_side_queue(self, side_queue) -> None:
+        if hasattr(self.model_runner, "set_async_draft_side_queue"):
+            self.model_runner.set_async_draft_side_queue(side_queue)
+
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
         if self.profiler_config is None or self.profiler_config.profiler is None:
