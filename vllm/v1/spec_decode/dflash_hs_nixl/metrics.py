@@ -70,7 +70,20 @@ def start_sink_metrics_server(
     _model_name = model_name or "unknown"
     _bytes_per_block = int(bytes_per_block)
     _num_gpu_blocks = int(num_gpu_blocks)
-    start_http_server(port, addr=host)
+    try:
+        start_http_server(port, addr=host)
+    except OSError as e:
+        # Stale sink from a prior launch often still holds :9101. Draft serving
+        # can continue without Prometheus; do not abort a ready runner.
+        logger.warning(
+            "DFlash HS NIXL sink metrics failed to bind http://%s:%d/metrics (%s). "
+            "Continuing without metrics; kill the stale sink or pass "
+            "--metrics-port 0 / a free port.",
+            host,
+            port,
+            e,
+        )
+        return
     _metrics_started = True
 
     # Match EngineCore: cache_config_info is a gauge=1 with num_gpu_blocks label.

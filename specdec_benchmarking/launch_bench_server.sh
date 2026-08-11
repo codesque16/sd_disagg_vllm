@@ -1022,6 +1022,29 @@ if [[ "$NSYS" -eq 1 ]]; then
   fi
 fi
 
+preflight_kill_stale_hs_nixl() {
+  # Prior PD*S* launches often leave DFlashHsNixlSink + :9101 / ZMQ bind alive;
+  # the next sink then OOMs on that GPU and dies on Address already in use.
+  local p
+  echo "# preflight: clearing stale HS NIXL sink / metrics port ${DRAFT_METRICS_PORT}"
+  pkill -9 -f '[d]flash_hs_nixl_sink' 2>/dev/null || true
+  pkill -9 -f '[V]LLM::DFlashHsNixlSink' 2>/dev/null || true
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k "${DRAFT_METRICS_PORT}/tcp" 2>/dev/null || true
+    # Default ZMQ bind port from DRAFT_BIND (tcp://0.0.0.0:50051 → 50051).
+    local zmq_port
+    zmq_port="${DRAFT_BIND##*:}"
+    if [[ "$zmq_port" =~ ^[0-9]+$ ]]; then
+      fuser -k "${zmq_port}/tcp" 2>/dev/null || true
+    fi
+  fi
+  sleep 1
+}
+
+if [[ "$HS_NIXL_SINK" -eq 1 ]]; then
+  preflight_kill_stale_hs_nixl
+fi
+
 # ---------- build + launch ----------
 COMMON=()
 while IFS= read -r line; do
