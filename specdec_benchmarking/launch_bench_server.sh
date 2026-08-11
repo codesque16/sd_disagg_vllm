@@ -28,6 +28,11 @@ DRAFT_MODEL="${DRAFT_MODEL:-z-lab/gpt-oss-20b-DFlash}"
 NUM_SPEC_TOKENS="${NUM_SPEC_TOKENS:-7}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-256}"
+# Uniform decode tokens = num_reqs * (1 + num_speculative_tokens). Default CG
+# max is often 1024 → only 128 reqs at query_len=8 stay on-graph; above that
+# verify decode jumps ~2x (Amit: 42ms vs 22ms). Cover full max_num_seqs by
+# default; override with --max-cudagraph-capture-size / env.
+MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32786}"
 BLOCK_SIZE="${BLOCK_SIZE:-16}"
 NIXL_PREFILL_PORT="${NIXL_PREFILL_PORT:-5600}"
@@ -115,7 +120,12 @@ Options:
   --batched-tokens N       max-num-batched-tokens for vllm serve / verify
                            (alias: --max-num-batched-tokens; or use _bN in CASE).
                            Not passed to Disagg-DFlash draft server.
-  --max-num-seqs N         max-num-seqs (default: 600, or MAX_NUM_SEQS env)
+  --max-num-seqs N         max-num-seqs (default: 256, or MAX_NUM_SEQS env)
+  --max-cudagraph-capture-size N
+                           CUDA graph capture token cap (default:
+                           max_num_seqs * (1+num_speculative_tokens), e.g.
+                           256*8=2048). Avoids verify decode 2x cliff above
+                           128 reqs when capture max was 1024.
   --devices IDS            CUDA_VISIBLE_DEVICES for colocated / verify (e.g. 0,1)
   --port PORT              HTTP port for colocated / verify server (default 8000)
   --prefill-devices IDS    GPUs for prefill (P/D disagg)
@@ -380,6 +390,11 @@ kv_json() {
 
 common_flags() {
   # Shared flags for all roles.
+  # decode_query_len = 1 + NUM_SPEC_TOKENS (DFlash verify uniform decode).
+  local cg_max="${MAX_CUDAGRAPH_CAPTURE_SIZE}"
+  if [[ -z "$cg_max" ]]; then
+    cg_max=$((MAX_NUM_SEQS * (NUM_SPEC_TOKENS + 1)))
+  fi
   cat <<EOF
 --served-model-name ${MODEL}
 --dtype auto
@@ -387,6 +402,7 @@ common_flags() {
 --max-num-seqs ${MAX_NUM_SEQS}
 --max-model-len ${MAX_MODEL_LEN}
 --max-num-batched-tokens ${BATCHED}
+--max-cudagraph-capture-size ${cg_max}
 --block-size ${BLOCK_SIZE}
 --no-enable-prefix-caching
 --enable-mfu-metrics
@@ -912,6 +928,7 @@ while [[ $# -gt 0 ]]; do
     --enable-logging-iteration-details) ENABLE_LOGGING_ITERATION_DETAILS=1; shift ;;
     --batched-tokens|--max-num-batched-tokens) BATCHED="${2:?}"; shift 2 ;;
     --max-num-seqs) MAX_NUM_SEQS="${2:?}"; shift 2 ;;
+    --max-cudagraph-capture-size) MAX_CUDAGRAPH_CAPTURE_SIZE="${2:?}"; shift 2 ;;
     --devices) DEVICES="${2:?}"; shift 2 ;;
     --port) PORT="${2:?}"; shift 2 ;;
     --prefill-devices) PREFILL_DEVICES="${2:?}"; shift 2 ;;
@@ -972,6 +989,9 @@ fi
 TAG="${CASE_BASE}_b${BATCHED}"
 
 echo "# case=${CASE_BASE}  tag=${TAG}  mode=${MODE}  batched=${BATCHED}"
+# Same default as common_flags: cover full uniform-decode concurrency on-graph.
+_CG_MAX="${MAX_CUDAGRAPH_CAPTURE_SIZE:-$((MAX_NUM_SEQS * (NUM_SPEC_TOKENS + 1)))}"
+echo "# max-num-seqs=${MAX_NUM_SEQS}  num_spec=${NUM_SPEC_TOKENS}  max-cudagraph-capture-size=${_CG_MAX}  (uniform decode on-graph up to $(( _CG_MAX / (NUM_SPEC_TOKENS + 1) )) reqs)"
 if [[ "$MODE" == sd_disagg || "$MODE" == colocated_sd || "$MODE" == disagg_sd ]]; then
   if [[ "$USE_SYNTHETIC" -eq 1 ]]; then
     echo "# rejection_sample=synthetic (paper A/B). For real quality: --no-synthetic"
