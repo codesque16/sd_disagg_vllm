@@ -121,6 +121,21 @@ class _BlockPool:
         self.num_blocks = num_blocks
         self._free = list(range(num_blocks - 1, 0, -1))
 
+    @property
+    def free_blocks(self) -> int:
+        return len(self._free)
+
+    @property
+    def usable_blocks(self) -> int:
+        return max(self.num_blocks - 1, 0)
+
+    @property
+    def usage(self) -> float:
+        usable = self.usable_blocks
+        if usable <= 0:
+            return 0.0
+        return (usable - self.free_blocks) / usable
+
     def allocate(self, n: int) -> list[int]:
         if n > len(self._free):
             raise RuntimeError(
@@ -214,6 +229,8 @@ class DFlashDraftRunner:
         self.spec: DFlashSpeculator | None = None
         self.block_tables: BlockTables | None = None
         self.kv_cache_config: KVCacheConfig | None = None
+        self.bytes_per_block: int = 0
+        self.num_gpu_blocks: int = 0
         self._kv_caches: list[torch.Tensor] = []
         # Durable per-slot GPU state (like verify req_states) — avoid rebuild
         # + full H2D on every SPECulate.
@@ -304,6 +321,8 @@ class DFlashDraftRunner:
             bytes_per_block,
             available / (1024**3),
         )
+        self.bytes_per_block = int(bytes_per_block)
+        self.num_gpu_blocks = int(num_gpu_blocks)
 
         kv_cache_tensors = [
             KVCacheTensor(
@@ -445,6 +464,24 @@ class DFlashDraftRunner:
             self.max_num_seqs, dtype=torch.int32, device=device
         )
 
+    def publish_kv_metrics(self) -> None:
+        """Push current draft KV pool usage to the sink Prometheus gauges."""
+        if self._pool is None:
+            return
+        try:
+            from vllm.v1.spec_decode.dflash_hs_nixl.metrics import observe_draft_kv
+
+            observe_draft_kv(
+                usage=self._pool.usage,
+                free_blocks=self._pool.free_blocks,
+                num_seqs=len(self._seqs),
+                bytes_per_block=self.bytes_per_block,
+                num_gpu_blocks=self.num_gpu_blocks,
+            )
+        except Exception:
+            # Metrics must never break the draft path.
+            pass
+
     def free(self, req_ids: list[str]) -> None:
         assert self._pool is not None
         assert self.block_tables is not None
@@ -468,6 +505,7 @@ class DFlashDraftRunner:
                 self._seeds[slot] = 0
         if touched:
             self.block_tables.num_blocks.copy_to_uva()
+            self.publish_kv_metrics()
 
     def _ensure_seq(self, req_id: str) -> int:
         if req_id in self._seqs:
@@ -494,6 +532,7 @@ class DFlashDraftRunner:
         extra = self._pool.allocate(need_blocks - have)
         state["blocks"].extend(extra)
         state["num_blocks"] = len(state["blocks"])
+        self.publish_kv_metrics()
         return True
 
     def _flush_dirty_block_tables(self, dirty_req_ids: list[str]) -> None:

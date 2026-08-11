@@ -325,6 +325,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--dtype", type=str, default="auto")
     parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=9101,
+        help="Prometheus /metrics port for draft KV stats "
+        "(0 disables; default 9101).",
+    )
+    parser.add_argument(
+        "--metrics-host",
+        type=str,
+        default="0.0.0.0",
+        help="Host for Prometheus /metrics (default 0.0.0.0).",
+    )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         logger.warning("Ignoring unknown sink args: %s", unknown)
@@ -363,6 +376,19 @@ def main(argv: list[str] | None = None) -> int:
             block_size=args.block_size,
             device=device,
         )
+        if args.metrics_port > 0:
+            from vllm.v1.spec_decode.dflash_hs_nixl.metrics import (
+                start_sink_metrics_server,
+            )
+
+            start_sink_metrics_server(
+                args.metrics_port,
+                host=args.metrics_host,
+                model_name=args.draft_model,
+                bytes_per_block=draft_runner.bytes_per_block,
+                num_gpu_blocks=draft_runner.num_gpu_blocks,
+            )
+            draft_runner.publish_kv_metrics()
 
     sink = HsNixlSink(args.bind, device, draft_runner=draft_runner)
 

@@ -29,6 +29,11 @@
 #   ./benchmark_random.sh --tag PD1_b8192 --nsys --request-rates 4 \
 #       --num-prompts 8 --no-warmup
 #
+#   # PD*S* + --hs-nixl-sink: scrape verify (:PORT) + sink draft KV (:9101)
+#   ./benchmark_random.sh --tag PD1S1_b8192_disagg --port 8000 \
+#       --request-rates 16 --duration-sec 20 \
+#       --draft-metrics-url http://127.0.0.1:9101
+#
 # Results land in ./bench_results/<tag>/r<REQUEST_RATE>/
 #   server_metrics.csv / draft_metrics.csv / prefill_metrics.csv / ...
 set -euo pipefail
@@ -74,7 +79,8 @@ usage() {
   echo "                         cudaProfilerApi capture on servers launched" >&2
   echo "                         with launch_bench_server.sh --nsys)" >&2
   echo "  --metrics-url ROLE=URL extra /metrics scrape target (repeatable)" >&2
-  echo "  --draft-metrics-url    shorthand for --metrics-url draft=URL" >&2
+  echo "  --draft-metrics-url    scrape draft/sink /metrics → draft_metrics.csv" >&2
+  echo "                         (HS NIXL sink default: http://127.0.0.1:9101)" >&2
   echo "  --prefill-metrics-url  shorthand for --metrics-url prefill=URL" >&2
   echo "  --decode-metrics-url   shorthand for --metrics-url decode=URL" >&2
   echo "Note: --max-concurrency is NOT set (no concurrency cap)." >&2

@@ -12,6 +12,11 @@
 #   ./benchmark_dataset.sh --tag PD1S1_math500_colocated --dataset math500 \
 #       --request-rates 8 --num-prompts 100 --temperature 0
 #
+#   # PD*S* + --hs-nixl-sink: also scrape sink draft KV
+#   ./benchmark_dataset.sh --tag PD1S1_gsm8k_disagg --dataset gsm8k \
+#       --request-rates 16 --num-prompts 100 --temperature 0 \
+#       --draft-metrics-url http://127.0.0.1:9101
+#
 # Compare acceptance later:
 #   python3 check_spec_quality.py compare \
 #     --baseline 'bench_results/PD1S1_gsm8k_colocated/r8/*.json' \
@@ -30,6 +35,8 @@ TEMPERATURE="0"
 DISABLE_WARMUP=0
 REQUEST_RATES_CSV="8"
 SEED=42
+METRICS_URLS=()
+METRICS_POLL_INTERVAL=5
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DATA_DIR="${SCRIPT_DIR}/bench_data"
@@ -39,7 +46,23 @@ usage() {
   echo "         [--model MODEL] [--port PORT] [--request-rates R1,R2]" >&2
   echo "         [--num-prompts N] [--output-len N] [--temperature T]" >&2
   echo "         [--seed N] [--no-warmup]" >&2
+  echo "         [--draft-metrics-url URL] [--metrics-url ROLE=URL]..." >&2
+  echo "  --draft-metrics-url  scrape draft/sink /metrics → draft_metrics.csv" >&2
+  echo "                       (HS NIXL sink default: http://127.0.0.1:9101)" >&2
   exit 1
+}
+
+add_metrics_url() {
+  local role="$1" url="$2"
+  if [ -z "$role" ] || [ -z "$url" ]; then
+    echo "ERROR: metrics URL requires ROLE and URL" >&2
+    usage
+  fi
+  if [[ ! "$role" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+    echo "ERROR: invalid metrics ROLE '$role' (use letters/digits/_)" >&2
+    exit 1
+  fi
+  METRICS_URLS+=("${role}=${url}")
 }
 
 parse_rate_list() {
@@ -72,6 +95,19 @@ while [ $# -gt 0 ]; do
     --burstiness) BURSTINESS="${2:?}"; shift 2 ;;
     --request-rates|--concurrencies) REQUEST_RATES_CSV="${2:?}"; shift 2 ;;
     --no-warmup|--disable-warmup) DISABLE_WARMUP=1; shift ;;
+    --metrics-url)
+      kv="${2:?--metrics-url requires ROLE=URL}"
+      shift 2
+      if [[ "$kv" != *=* ]]; then
+        echo "ERROR: --metrics-url expects ROLE=URL, got: $kv" >&2
+        usage
+      fi
+      add_metrics_url "${kv%%=*}" "${kv#*=}"
+      ;;
+    --draft-metrics-url)
+      add_metrics_url "draft" "${2:?--draft-metrics-url requires a URL}"
+      shift 2
+      ;;
     -h|--help) usage ;;
     *) echo "Unknown argument: $1" >&2; usage ;;
   esac
@@ -109,12 +145,84 @@ fi
 BASE_URL="http://localhost:${PORT}"
 RESULT_ROOT="${SCRIPT_DIR}/bench_results/${TAG}"
 
+# Always scrape the client-facing server unless already registered.
+_has_server=0
+for kv in "${METRICS_URLS[@]+"${METRICS_URLS[@]}"}"; do
+  [ "${kv%%=*}" = "server" ] && _has_server=1
+done
+if [ "$_has_server" -eq 0 ]; then
+  METRICS_URLS=("server=${BASE_URL}" "${METRICS_URLS[@]+"${METRICS_URLS[@]}"}")
+fi
+
+scrape_metric() {
+  grep -E "^vllm:(${2})(\{|[[:space:]])" "$1" 2>/dev/null \
+    | awk '{s+=$NF} END {if (NR>0) printf "%.6g", s}' || true
+}
+scrape_metric_first() {
+  local file="$1" names="$2"
+  grep -E "^vllm:(${names})(\{|[[:space:]])" "$file" 2>/dev/null \
+    | awk 'NR==1 {printf "%.6g", $NF; exit}' || true
+}
+scrape_cache_config_label() {
+  local file="$1" label="$2"
+  grep -E '^vllm:cache_config_info\{' "$file" 2>/dev/null | head -1 \
+    | sed -n "s/.*${label}=\"\([^\"]*\)\".*/\1/p" || true
+}
+poll_metrics() {
+  local metrics_base="$1"
+  local out_csv="$2"
+  local tmp
+  tmp=$(mktemp)
+  echo "unix_ts,kv_cache_usage_perc,kv_cache_block_size_bytes,kv_cache_num_blocks,kv_cache_usage_gib,kv_cache_total_gib,kv_cache_usage_bytes,kv_cache_total_bytes,num_requests_running,num_requests_waiting,preemptions_total,prompt_tokens_total,generation_tokens_total,prefix_cache_queries_total,prefix_cache_hits_total,estimated_flops_per_gpu_total,estimated_read_bytes_per_gpu_total,estimated_write_bytes_per_gpu_total" > "$out_csv"
+  while true; do
+    if curl -sf --max-time 2 "${metrics_base%/}/metrics" -o "$tmp"; then
+      local ts kv bs nblocks_raw nblocks kv_gib kv_tot_gib kv_b kv_tot_b
+      local n_run n_wait pre ptok gtok pcq pch flops rbytes wbytes
+      ts=$(date +%s.%N)
+      kv=$(scrape_metric  "$tmp" "kv_cache_usage_perc|gpu_cache_usage_perc")
+      bs=$(scrape_metric_first "$tmp" "kv_cache_block_size_bytes")
+      nblocks_raw=$(scrape_cache_config_label "$tmp" "num_gpu_blocks")
+      if [ -n "$nblocks_raw" ] && [ "$nblocks_raw" -gt 1 ] 2>/dev/null; then
+        nblocks=$((nblocks_raw - 1))
+      else
+        nblocks=""
+      fi
+      kv_tot_b=""; kv_b=""; kv_tot_gib=""; kv_gib=""
+      if [ -n "$bs" ] && [ -n "$nblocks" ] \
+          && awk -v b="$bs" -v n="$nblocks" 'BEGIN {exit !(b>0 && n>0)}'; then
+        kv_tot_b=$(awk -v n="$nblocks" -v b="$bs" 'BEGIN {printf "%.0f", n*b}')
+        kv_tot_gib=$(awk -v t="$kv_tot_b" 'BEGIN {printf "%.6g", t/(1024^3)}')
+        if [ -n "$kv" ]; then
+          kv_b=$(awk -v u="$kv" -v t="$kv_tot_b" 'BEGIN {printf "%.0f", u*t}')
+          kv_gib=$(awk -v u="$kv" -v t="$kv_tot_gib" 'BEGIN {printf "%.6g", u*t}')
+        fi
+      fi
+      n_run=$(scrape_metric "$tmp" "num_requests_running")
+      n_wait=$(scrape_metric "$tmp" "num_requests_waiting")
+      pre=$(scrape_metric "$tmp" "num_preemptions_total|num_preemptions")
+      ptok=$(scrape_metric "$tmp" "prompt_tokens_total|prompt_tokens")
+      gtok=$(scrape_metric "$tmp" "generation_tokens_total|generation_tokens")
+      pcq=$(scrape_metric "$tmp" "gpu_prefix_cache_queries_total|prefix_cache_queries_total|prefix_cache_queries")
+      pch=$(scrape_metric "$tmp" "gpu_prefix_cache_hits_total|prefix_cache_hits_total|prefix_cache_hits")
+      flops=$(scrape_metric "$tmp" "estimated_flops_per_gpu_total")
+      rbytes=$(scrape_metric "$tmp" "estimated_read_bytes_per_gpu_total")
+      wbytes=$(scrape_metric "$tmp" "estimated_write_bytes_per_gpu_total")
+      echo "$ts,$kv,$bs,$nblocks,$kv_gib,$kv_tot_gib,$kv_b,$kv_tot_b,$n_run,$n_wait,$pre,$ptok,$gtok,$pcq,$pch,$flops,$rbytes,$wbytes" >> "$out_csv"
+    fi
+    sleep "$METRICS_POLL_INTERVAL"
+  done
+}
+
 DATASET_N=$(wc -l < "$DATASET_PATH" | tr -d ' ')
 echo "Model:     $MODEL"
 echo "Dataset:   $DATASET_PATH ($DATASET_N prompts)"
 echo "Temp:      $TEMPERATURE"
 echo "Out len:   $OUTPUT_LEN"
 echo "Results:   $RESULT_ROOT"
+echo "Metrics scrape targets:"
+for kv in "${METRICS_URLS[@]}"; do
+  echo "  ${kv%%=*} -> ${kv#*=}/metrics"
+done
 echo "NOTE: For acceptance-rate comparisons launch the server with --no-synthetic."
 
 for R in "${REQUEST_RATES[@]}"; do
@@ -141,6 +249,16 @@ for R in "${REQUEST_RATES[@]}"; do
   fi
 
   echo "=== [${TAG}] dataset=$(basename "$DATASET_PATH") rate=${R} temp=${TEMPERATURE} n=${NUM_PROMPTS} ==="
+
+  POLLER_PIDS=()
+  for kv in "${METRICS_URLS[@]}"; do
+    role="${kv%%=*}"
+    url="${kv#*=}"
+    csv="$RUN_DIR/${role}_metrics.csv"
+    poll_metrics "$url" "$csv" &
+    POLLER_PIDS+=($!)
+  done
+  trap 'kill "${POLLER_PIDS[@]}" 2>/dev/null || true' EXIT
 
   BENCH_CMD=(
     vllm bench serve
@@ -174,6 +292,12 @@ for R in "${REQUEST_RATES[@]}"; do
   else
     "${BENCH_CMD[@]}" 2>&1 | tee "$LOG_FILE"
   fi
+
+  kill "${POLLER_PIDS[@]}" 2>/dev/null || true
+  for pid in "${POLLER_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  trap - EXIT
 
   # Attach a small acceptance summary sidecar for quick compare.
   RESULT_JSON="$RUN_DIR/$OUT_FILE"

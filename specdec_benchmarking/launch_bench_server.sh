@@ -37,6 +37,8 @@ PROXY_PORT="${PROXY_PORT:-8000}"
 # Disagg-DFlash (PV*S*): remote draft server bind + verify connect addr.
 DRAFT_BIND="${DRAFT_BIND:-tcp://0.0.0.0:50051}"
 DRAFT_ADDR="${DRAFT_ADDR:-tcp://127.0.0.1:50051}"
+# Prometheus /metrics for HS NIXL sink draft KV (benchmark_random --draft-metrics-url).
+DRAFT_METRICS_PORT="${DRAFT_METRICS_PORT:-9101}"
 DISAGG_DFLASH_TRANSPORT="${DISAGG_DFLASH_TRANSPORT:-nixl}"
 DISAGG_ASYNC=1
 # Milestone-2: colocated PD*S* + NIXL HS sink on --draft-devices (remote-only draft).
@@ -1028,6 +1030,8 @@ case "$MODE" in
         DRAFT_DEVICES=$((last_verify_dev + 1))
       fi
       echo "# HS NIXL sink: devices=${DRAFT_DEVICES} bind=${DRAFT_BIND} addr=${DRAFT_ADDR}"
+      echo "# HS NIXL sink metrics: http://127.0.0.1:${DRAFT_METRICS_PORT}/metrics"
+      echo "# pair with: ./benchmark_random.sh ... --draft-metrics-url http://127.0.0.1:${DRAFT_METRICS_PORT}"
       sink_cmd=(
         env
         HF_HUB_OFFLINE=1
@@ -1043,6 +1047,7 @@ case "$MODE" in
         --max-num-batched-tokens "$BATCHED"
         --gpu-memory-utilization "$GPU_MEM_UTIL"
         --block-size "$BLOCK_SIZE"
+        --metrics-port "$DRAFT_METRICS_PORT"
       )
     fi
 

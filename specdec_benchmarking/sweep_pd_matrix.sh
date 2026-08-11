@@ -32,6 +32,7 @@ BENCH_RANDOM="./benchmark_random.sh"
 BENCH_DATASET="./benchmark_dataset.sh"
 
 PORT="${PORT:-8000}"
+DRAFT_METRICS_PORT="${DRAFT_METRICS_PORT:-9101}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-900}"
 CLEANUP_WAIT_S="${CLEANUP_WAIT_S:-90}"
 SLEEP_AFTER_CLEANUP_S="${SLEEP_AFTER_CLEANUP_S:-5}"
@@ -371,6 +372,12 @@ run_one() {
     --input-len "$INPUT_LEN"
     --output-len "$OUTPUT_LEN"
   )
+  # Disagg: also scrape sink draft KV (/metrics) into draft_metrics.csv.
+  if [[ "$variant" == "disagg" ]]; then
+    random_cmd+=(
+      --draft-metrics-url "http://127.0.0.1:${DRAFT_METRICS_PORT}"
+    )
+  fi
   local -a gsm8k_cmd=(
     "$BENCH_DATASET" --tag "$tag_gsm8k" --port "$PORT"
     --dataset gsm8k
@@ -378,6 +385,11 @@ run_one() {
     --num-prompts "$GSM8K_NUM_PROMPTS"
     --temperature "$GSM8K_TEMPERATURE"
   )
+  if [[ "$variant" == "disagg" ]]; then
+    gsm8k_cmd+=(
+      --draft-metrics-url "http://127.0.0.1:${DRAFT_METRICS_PORT}"
+    )
+  fi
   if [[ "$NO_WARMUP" -eq 1 ]]; then
     random_cmd+=(--no-warmup)
     gsm8k_cmd+=(--no-warmup)
