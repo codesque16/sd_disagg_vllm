@@ -1021,7 +1021,12 @@ case "$MODE" in
 
     sink_cmd=()
     if [[ "$MODE" == colocated_sd && "$HS_NIXL_SINK" -eq 1 ]]; then
-      DRAFT_DEVICES="${DRAFT_DEVICES:-1}"
+      # Sink on the first GPU after the verify TP set (PD1S1→1, PD2S1→2).
+      # Hardcoding 1 collides with verify TP rank1 when TP>1.
+      if [[ -z "${DRAFT_DEVICES:-}" ]]; then
+        last_verify_dev=$(awk -F, '{print $NF}' <<<"$DEVICES")
+        DRAFT_DEVICES=$((last_verify_dev + 1))
+      fi
       echo "# HS NIXL sink: devices=${DRAFT_DEVICES} bind=${DRAFT_BIND} addr=${DRAFT_ADDR}"
       sink_cmd=(
         env

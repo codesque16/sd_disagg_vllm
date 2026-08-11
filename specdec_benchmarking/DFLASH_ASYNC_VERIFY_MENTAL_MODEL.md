@@ -3,14 +3,16 @@
 Disaggregated speculative decode with `disagg_dflash_remote_only` + `disagg_dflash_async_verify`.
 No ping-pong HS slots. One shared verify HS buffer, gated by staging release; socket is 1-deep; FREE is deferred off execute start when busy.
 
+**TP>1:** only verify **TP0** owns HS staging / NIXL / ZMQ / CPU_7 publish (`GPU:0_*` naming below means that TP0 device). Non-TP0 ranks still run the target forward and install scheduled draft ids in `prepare_inputs`; they do not open a probe.
+
 ---
 
 ## 1. Naming convention
 
 | Prefix | Meaning |
 |--------|---------|
-| `GPU:0_*` | Buffer on verify GPU (device 0) |
-| `GPU:1_*` | Buffer on draft/sink GPU (device 1) |
+| `GPU:0_*` | Buffer on verify TP0 GPU (device 0 when TP=1) |
+| `GPU:1_*` | Buffer on draft/sink GPU (device 1 when TP=1; after verify TP set when TP>1) |
 | `CPU_*` | Host / CPU memory (pinned or ordinary) |
 | `T_*` | Thread or process actor |
 | Shared | Same object touched by more than one `T_*` |

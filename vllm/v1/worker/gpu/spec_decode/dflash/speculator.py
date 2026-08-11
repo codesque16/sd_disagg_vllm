@@ -9,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
@@ -139,7 +140,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Queue ids and send FREE once the socket is idle (after reply / poll).
         self._async_deferred_free_ids: set[str] = set()
         addr = self.speculative_config.disagg_dflash_address
-        if addr:
+        # HS NIXL / ZMQ is 1-deep and owned by verify TP0 only. Non-TP0 ranks
+        # still combine HS and (async) install scheduled draft ids; they must
+        # not open a second DEALER against the sink. TP=1 is always rank 0.
+        if addr and get_tp_group().rank == 0:
             from vllm.v1.spec_decode.dflash_hs_nixl import DFlashHsNixlProbe
 
             self._hs_nixl_probe = DFlashHsNixlProbe(
@@ -168,6 +172,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                     "local draft still used for serving (dual-run)",
                     addr,
                 )
+        elif addr:
+            logger.info(
+                "DFlash HS NIXL probe skipped on TP rank %s (TP0 owns sink)",
+                get_tp_group().rank,
+            )
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -457,6 +466,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             if dummy_run:
                 # Memory/cudagraph warmup: no sink round-trip; no local draft.
                 return self.draft_tokens[:num_reqs]
+            # Non-TP0: no probe. Async drafts land via schedule + prepare_inputs.
+            if self._hs_nixl_probe is None:
+                if self.async_verify:
+                    return None
+                raise RuntimeError(
+                    "disagg_dflash_remote_only without a HS NIXL probe on this "
+                    "rank requires TP=1 or disagg_dflash_async_verify=true "
+                    "(non-TP0 cannot sync-wait on the sink)."
+                )
             return self._propose_remote_only(
                 input_batch=input_batch,
                 num_reqs=num_reqs,
