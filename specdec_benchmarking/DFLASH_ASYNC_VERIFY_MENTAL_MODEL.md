@@ -338,3 +338,15 @@ T_exec_0 prepare_inputs:        T_exec_1 prepare_inputs:
 | GPU:0rk_4 | Rank k `req_states.draft_tokens` |
 | Probe gate | `get_tp_group().rank == 0` in `DFlashSpeculator.__init__` |
 | Side-channel gate | `async_draft_side_queue` only if `is_driver_worker` |
+
+---
+
+## 11. Perf note — mid-run GPU-idle `execute_context` gaps
+
+Long idle gaps inside verify `execute_context` (nsys: `posix_spawn` → `waitpid` → `cuModuleLoadData`) are usually **not** draft-wait (`blocked_0`). On gpt-oss they come from late Triton JIT of MoE routing:
+
+- `_topk_forward`, `_sum_bitmatrix_rows`, `_combined_routing_memset` / `_combined_routing_compute(_pow2)`
+- Path: `triton_kernel_moe_forward` / `make_routing_data` in `gpt_oss_triton_kernels_moe.py`
+- Compile keys include bitmatrix strides `cdiv(n_tokens, 32)*32`, so each 32-token pad bucket can re-JIT
+
+Init warmup: `gpt_oss_triton_moe_warmup` (from `kernel_warmup`) exercises that routing subgraph for every stride bucket up to `max_num_batched_tokens` before `jit_monitor` activates. Dense `_dummy_run` sweeps alone are not enough when live mixed/prefill sizes differ from CUDA-graph-padded shapes.

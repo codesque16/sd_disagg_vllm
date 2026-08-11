@@ -25,6 +25,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.gpt_oss_triton_moe_warmup import (
+    gpt_oss_triton_moe_warmup,
+)
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
@@ -86,6 +89,18 @@ def kernel_warmup(worker: "Worker"):
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
     deepseek_v4_mhc_warmup(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=(
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        ),
+    )
+
+    # gpt-oss / OAI Triton MoE routing (_topk_forward, bitmatrix sum,
+    # _combined_routing_*). Compile keys include bitmatrix strides that
+    # depend on cdiv(n_tokens, 32)*32; dummy_run sweeps alone still miss
+    # live mixed/prefill sizes. No-op when the model has no OAITriton experts.
+    gpt_oss_triton_moe_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=(
