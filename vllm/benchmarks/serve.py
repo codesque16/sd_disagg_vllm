@@ -71,6 +71,49 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 )
 
 
+# /stop_profile can block for a long time under nsys + TP (collective
+# cuda.profiler.stop). Keep this short so --save-result still runs.
+_PROFILE_STOP_TIMEOUT_S = 30.0
+_PROFILE_START_TIMEOUT_S = 60.0
+
+
+async def _call_profiler_endpoint(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    timeout_s: float,
+    action: str,
+) -> bool:
+    """POST /start_profile or /stop_profile without a completions payload.
+
+    Using the OpenAI streaming request helper against these endpoints is wrong
+    and /stop_profile can hang forever under nsys, which prevented --save-result
+    from ever writing the JSON (save runs only after ``benchmark()`` returns).
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with session.post(url, timeout=timeout) as resp:
+            if resp.status == 200:
+                return True
+            body = await resp.text()
+            print(
+                f"WARNING: {action} profiler failed "
+                f"(HTTP {resp.status}): {body[:200]!r}"
+            )
+            return False
+    except TimeoutError:
+        print(
+            f"WARNING: {action} profiler timed out after {timeout_s:.0f}s ({url}). "
+            "Under nsys+TP, /stop_profile often blocks in cuda.profiler.stop(); "
+            "benchmark metrics were already computed and will still be saved. "
+            "Stop the nsys-wrapped server to finalize the .nsys-rep."
+        )
+        return False
+    except Exception as e:
+        print(f"WARNING: {action} profiler failed ({url}): {e}")
+        return False
+
+
 async def _align_prompts_to_server_tokenizer(
     base_url: str,
     model_id: str,
@@ -918,24 +961,12 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            model_name=model_name,
-            prompt=test_prompt,
-            api_url=base_url + "/start_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-            multi_modal_content=test_mm_content,
-            ignore_eos=ignore_eos,
-            extra_headers=extra_headers,
-            extra_body=test_extra_body,
-            chat_messages=test_chat_messages,
-        )
-        profile_output = await request_func(
-            request_func_input=profile_input, session=session
-        )
-        if profile_output.success:
+        if await _call_profiler_endpoint(
+            session,
+            base_url + "/start_profile",
+            timeout_s=_PROFILE_START_TIMEOUT_S,
+            action="start",
+        ):
             print("Profiler started")
 
     distribution = "Poisson process" if burstiness == 1.0 else "Gamma distribution"
@@ -1341,18 +1372,13 @@ async def benchmark(
 
     if profile:
         print("Stopping profiler...")
-        profile_input = RequestFuncInput(
-            model=model_id,
-            prompt=test_prompt,
-            api_url=base_url + "/stop_profile",
-            prompt_len=test_prompt_len,
-            output_len=test_output_len,
-            logprobs=logprobs,
-        )
-        profile_output = await request_func(
-            request_func_input=profile_input, session=session
-        )
-        if profile_output.success:
+        # Bounded wait: never block --save-result on nsys/TP stop hangs.
+        if await _call_profiler_endpoint(
+            session,
+            base_url + "/stop_profile",
+            timeout_s=_PROFILE_STOP_TIMEOUT_S,
+            action="stop",
+        ):
             print("Profiler stopped")
 
     await session.close()
