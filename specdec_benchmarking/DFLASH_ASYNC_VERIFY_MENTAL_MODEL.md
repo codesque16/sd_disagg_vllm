@@ -349,4 +349,14 @@ Long idle gaps inside verify `execute_context` (nsys: `posix_spawn` → `waitpid
 - Path: `triton_kernel_moe_forward` / `make_routing_data` in `gpt_oss_triton_kernels_moe.py`
 - Compile keys include bitmatrix strides `cdiv(n_tokens, 32)*32`, so each 32-token pad bucket can re-JIT
 
-Init warmup: `gpt_oss_triton_moe_warmup` (from `kernel_warmup`) exercises that routing subgraph for every stride bucket up to `max_num_batched_tokens` before `jit_monitor` activates. Dense `_dummy_run` sweeps alone are not enough when live mixed/prefill sizes differ from CUDA-graph-padded shapes.
+### Type-A mixed-step (TP>1)
+
+Worst holes (~0.5–1.2s on TP=4) are **mixed prefill+decode** steps whose total token count first-touches a new pad bucket:
+
+1. Attention / early kernels finish (~20ms into `execute_context`)
+2. GPU idle while CPU `posix_spawn`/`waitpid` compiles `_topk_forward` (then bitmatrix / combined routing)
+3. Resume MoE → fat `nccl AllReduce` / `multimem_all_reduce` while other ranks catch up
+
+Decode-only is healthy once routing buckets are warm. Long PV `hs_src_wait` outliers are a **symptom** of Type-A (TP0 busy in the prior step’s AllReduce / meta_pack), not a separate NIXL bug.
+
+Init warmup: `gpt_oss_triton_moe_warmup` runs from `kernel_warmup` (**pre_cudagraph**) and again at the end of V2 dummy warms (**post_dummy_warms**), covering every 32-token stride bucket (plus `pad-1`) up to `max_num_batched_tokens`. Dense `_dummy_run` sweeps alone are not enough when live mixed sizes differ from CUDA-graph-padded shapes. If discovery fails, logs a **warning** (silent no-op used to leave Type-A fully exposed).

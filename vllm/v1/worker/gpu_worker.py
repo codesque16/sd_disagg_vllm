@@ -902,6 +902,26 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # Type-A mixed-step nsys (PD4/PV4): first touch of large prefill+decode
+        # pad buckets still JIT'd _topk_forward after the earlier pre_cudagraph
+        # routing warm. Re-warm every stride bucket as the last step before
+        # ready so those keys cannot be missing.
+        from vllm.model_executor.warmup.gpt_oss_triton_moe_warmup import (
+            gpt_oss_triton_moe_warmup,
+        )
+
+        gpt_oss_triton_moe_warmup(
+            self.get_model(),
+            max_tokens=self.scheduler_config.max_num_batched_tokens,
+            cudagraph_capture_sizes=(
+                self.vllm_config.compilation_config.cudagraph_capture_sizes or []
+            ),
+            reason="post_dummy_warms",
+            # Type-A is large mixed prefill+decode; decode/small pads were
+            # already covered by pre_cudagraph + uniform-decode dummy warms.
+            min_tokens=2048,
+        )
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

@@ -100,12 +100,15 @@ def kernel_warmup(worker: "Worker"):
     # _combined_routing_*). Compile keys include bitmatrix strides that
     # depend on cdiv(n_tokens, 32)*32; dummy_run sweeps alone still miss
     # live mixed/prefill sizes. No-op when the model has no OAITriton experts.
+    # Re-run again at the end of compile_or_warm_up_model (see gpu_worker)
+    # so Type-A mixed-step pads stay compiled after cudagraph / dummy warms.
     gpt_oss_triton_moe_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
         cudagraph_capture_sizes=(
             worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
         ),
+        reason="pre_cudagraph",
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.
