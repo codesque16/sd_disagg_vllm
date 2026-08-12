@@ -43,6 +43,7 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
 )
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.profiler.nvtx import nvtx_range
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -1207,10 +1208,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
             # Propagate schedule step for DFlash NVTX correlation (kick/poll).
+            schedule_step = int(getattr(scheduler_output, "schedule_step", 0) or 0)
+            self._nvtx_schedule_step = schedule_step
             if self.speculator is not None:
-                self.speculator.last_verify_step = int(
-                    getattr(scheduler_output, "schedule_step", 0) or 0
-                )
+                self.speculator.last_verify_step = schedule_step
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
@@ -1480,130 +1481,143 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            self.pcp_manager, hidden_states, input_batch
-        )
+        # NVTX only — wraps existing order; do not reorder AsyncOutput vs postprocess.
+        vi = int(getattr(self, "_nvtx_schedule_step", 0) or 0)
+        with nvtx_range(f"i{vi}_sample_tokens", generic="sample_tokens"):
+            hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
+                self.pcp_manager, hidden_states, input_batch
+            )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+            with nvtx_range(f"i{vi}_sample", generic="sample"):
+                sampler_output, num_sampled, num_rejected = self.sample(
+                    hidden_states, input_batch, grammar_output
+                )
 
-        if self.pp_handler is not None:
-            # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            self.pp_handler.broadcast(
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
+            if self.pp_handler is not None:
+                # Broadcast to non-last PP ranks (handles spec decode multi-token).
+                self.pp_handler.broadcast(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch,
+                )
+
+            assert self.prompt_logprobs_worker is not None
+            prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
+                self.model.compute_logits,
+                hidden_states,
                 input_batch,
+                self.req_states.all_token_ids.gpu,
+                self.req_states.num_computed_tokens.gpu,
+                self.req_states.prompt_len.np,
             )
 
-        assert self.prompt_logprobs_worker is not None
-        prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
-            hidden_states,
-            input_batch,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.num_computed_tokens.gpu,
-            self.req_states.prompt_len.np,
-        )
-
-        # Prepare the model runner output.
-        model_runner_output = ModelRunnerOutput(
-            req_ids=input_batch.req_ids,
-            # NOTE(woosuk): req_id_to_index is unused in this model runner.
-            # Only for compatibility with the existing model runner and scheduler.
-            req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
-            sampled_token_ids=None,  # type: ignore
-            prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
-        )
-        # Start async output copy here so that it can overlap with speculator proposal.
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-        )
-
-        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
-            # Get cached multimodal embeddings for draft forward.
-            # NOTE: This is done here because postprocess updates
-            # num_computed_prefill_tokens.
-            # The EAGLE/MTP drafter reads one position ahead of the target.
-            mm_inputs = self.model_state.gather_mm_embeddings(
-                input_batch, draft_lookahead=1
+            # Prepare the model runner output.
+            model_runner_output = ModelRunnerOutput(
+                req_ids=input_batch.req_ids,
+                # NOTE(woosuk): req_id_to_index is unused in this model runner.
+                # Only for compatibility with the existing model runner and scheduler.
+                req_id_to_index={
+                    req_id: i for i, req_id in enumerate(input_batch.req_ids)
+                },
+                sampled_token_ids=None,  # type: ignore
+                prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            )
+            # Start async output copy here so that it can overlap with speculator
+            # proposal.
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
             )
 
-        # Postprocess results and update request states.
-        # NOTE: This is intentionally done after creating the AsyncOutput,
-        # ensuring that `copy_event` is recorded before calling postprocess.
-        # This sequencing may slightly reduce latency as async D2H copy does not
-        # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+            mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
+            if self.speculator is not None and self.speculator.supports_mm_inputs:
+                # Get cached multimodal embeddings for draft forward.
+                # NOTE: This is done here because postprocess updates
+                # num_computed_prefill_tokens.
+                # The EAGLE/MTP drafter reads one position ahead of the target.
+                mm_inputs = self.model_state.gather_mm_embeddings(
+                    input_batch, draft_lookahead=1
+                )
 
-        if self.speculator is not None:
-            assert self.sampler is not None
-            # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
-            # target returns a persistent buffer sized at max_num_batched_tokens;
-            # slice to the active token count that propose() expects.
-            spec_hidden_states = hidden_states
-            if hasattr(self.model, "get_mtp_target_hidden_states"):
-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
-            )
-            # Async remote-only: propose returns None after kick; drafts are
-            # installed later via poll_async_remote_drafts().
-            if draft_tokens is not None:
-                # Local draft-token memcpy (serving path) — do not block on GPU1 here.
-                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            # Postprocess results and update request states.
+            # NOTE: This is intentionally done after creating the AsyncOutput,
+            # ensuring that `copy_event` is recorded before calling postprocess.
+            # This sequencing may slightly reduce latency as async D2H copy does not
+            # need to wait for the postprocess to finish.
+            with nvtx_range(
+                f"i{vi}_postprocess_sampled", generic="postprocess_sampled"
+            ):
+                self.postprocess_sampled(
+                    input_batch.idx_mapping,
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch.query_start_loc,
+                )
 
-                # Dual-run: defer ZMQ recv until the *next* propose so this worker
-                # can prepare/launch the next execute_context first.
-                if hasattr(self.speculator, "defer_remote_dual_run"):
-                    self.speculator.defer_remote_dual_run(draft_tokens)
-
-                if self.num_speculative_steps > 0:
-                    # Spec-decode and diffusion LLMs both use draft tokens but the
-                    # latter does not have a speculator (i.e. self.speculator is None)
-                    self.draft_tokens_handler.set_draft_tokens(
+            if self.speculator is not None:
+                assert self.sampler is not None
+                # Let the target override the hidden state fed to the drafter
+                # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+                # target returns a persistent buffer sized at max_num_batched_tokens;
+                # slice to the active token count that propose() expects.
+                spec_hidden_states = hidden_states
+                if hasattr(self.model, "get_mtp_target_hidden_states"):
+                    pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                    spec_hidden_states = pre_hc_hidden_states[
+                        : hidden_states.shape[0]
+                    ]  # type: ignore[union-attr]
+                with nvtx_range(f"i{vi}_propose", generic="propose"):
+                    draft_tokens = self.speculator.propose(
                         input_batch,
-                        self.req_states.draft_tokens[input_batch.idx_mapping],
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        mm_inputs=mm_inputs,
                     )
+                # Async remote-only: propose returns None after kick; drafts are
+                # installed later via poll_async_remote_drafts().
+                if draft_tokens is not None:
+                    # Local draft-token memcpy (serving path) — do not block on GPU1.
+                    self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
-        elif self.num_speculative_steps > 0:
-            # Spec-decode and diffusion LLMs both use draft tokens but the latter does
-            # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
-            )
+                    # Dual-run: defer ZMQ recv until the *next* propose so this worker
+                    # can prepare/launch the next execute_context first.
+                    if hasattr(self.speculator, "defer_remote_dual_run"):
+                        self.speculator.defer_remote_dual_run(draft_tokens)
 
-        # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
-        model_runner_output.kv_connector_output = kv_connector_output
+                    if self.num_speculative_steps > 0:
+                        # Spec-decode and diffusion LLMs both use draft tokens but the
+                        # latter does not have a speculator (self.speculator is None)
+                        self.draft_tokens_handler.set_draft_tokens(
+                            input_batch,
+                            self.req_states.draft_tokens[input_batch.idx_mapping],
+                        )
 
-        return async_output
+            elif self.num_speculative_steps > 0:
+                # Spec-decode and diffusion LLMs both use draft tokens but the latter
+                # does not have a speculator (i.e. self.speculator is None)
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                )
+
+            # Post-step KV connector related operations.
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            model_runner_output.kv_connector_output = kv_connector_output
+
+            return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.draft_tokens_handler.get_draft_tokens()

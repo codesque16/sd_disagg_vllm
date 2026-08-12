@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.profiler.nvtx import nvtx_range
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -359,30 +360,37 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
-        last_hidden_states = self._run_model(
-            num_tokens_padded,
-            attn_metadata,
-            slot_mappings,
-            num_tokens_across_dp,
-            cudagraph_runtime_mode,
-        )
+        vi = int(getattr(self, "last_verify_step", 0) or 0)
+        with nvtx_range(
+            f"dflash_draft_forward_vi{vi}", generic="dflash_draft_forward"
+        ):
+            last_hidden_states = self._run_model(
+                num_tokens_padded,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
-        draft_tokens = self.sample_draft(
-            sample_hidden_states,
-            self.sample_pos[:num_sample] - 2,
-            self.sample_idx_mapping[:num_sample],
-            self.temperature,
-            self.seeds,
-            self.sample_col[:num_sample],
-            self.draft_logits,
-        )
-        self.draft_tokens[:num_reqs] = draft_tokens.view(
-            num_reqs, self.num_speculative_steps
-        )
+        with nvtx_range(
+            f"dflash_draft_sample_vi{vi}", generic="dflash_draft_sample"
+        ):
+            draft_tokens = self.sample_draft(
+                sample_hidden_states,
+                self.sample_pos[:num_sample] - 2,
+                self.sample_idx_mapping[:num_sample],
+                self.temperature,
+                self.seeds,
+                self.sample_col[:num_sample],
+                self.draft_logits,
+            )
+            self.draft_tokens[:num_reqs] = draft_tokens.view(
+                num_reqs, self.num_speculative_steps
+            )
 
     def _build_draft_attn_metadata(
         self,
@@ -443,21 +451,25 @@ class DFlashSpeculator(DraftModelSpeculator):
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+        vi = int(getattr(self, "last_verify_step", 0) or 0)
+        with nvtx_range(f"dflash_hs_prep_vi{vi}", generic="dflash_hs_prep"):
+            if aux_hidden_states:
+                hidden_states = self.model.combine_hidden_states(
+                    torch.cat(aux_hidden_states, dim=-1)
+                )
+            else:
+                hidden_states = last_hidden_states
+            # Wait only until prior NIXL staging released the source HS — before
+            # overwrite. Do not join remote SPECulate recv for this barrier.
+            if (
+                self._hs_nixl_probe is not None
+                and self.async_verify
+                and not dummy_run
+            ):
+                self._hs_nixl_probe.wait_hs_src_released()
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
             )
-        else:
-            hidden_states = last_hidden_states
-        # Wait only until prior NIXL staging released the source HS — before
-        # overwrite. Do not join remote SPECulate recv for this barrier.
-        if (
-            self._hs_nixl_probe is not None
-            and self.async_verify
-            and not dummy_run
-        ):
-            self._hs_nixl_probe.wait_hs_src_released()
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         # Milestone-2 remote-only: kick SPECulate, block for draft tokens, skip
         # local prepare/forward/sample (draft lives on the sink GPU).
@@ -534,13 +546,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
-            self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
-                self.context_positions[:num_target_tokens],
-            )
-            # DFlash processes all speculative tokens in one forward pass,
-            # so the real token count is num_query_tokens.
-            self._prepare_eplb_forward(num_query_tokens)
+            with nvtx_range(
+                f"dflash_draft_prepare_vi{vi}", generic="dflash_draft_prepare"
+            ):
+                self.model.precompute_and_store_context_kv(
+                    self.hidden_states[:num_target_tokens],
+                    self.context_positions[:num_target_tokens],
+                )
+                # DFlash processes all speculative tokens in one forward pass,
+                # so the real token count is num_query_tokens.
+                self._prepare_eplb_forward(num_query_tokens)
             self._generate_draft(
                 num_reqs,
                 num_query_tokens,
@@ -554,85 +569,94 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
-        # Support multiple draft KV cache groups by preparing inputs once for each
-        for i, gid in enumerate(self.draft_kv_cache_group_ids):
-            prepare_dflash_inputs(
-                self.input_buffers,
-                self.block_tables.slot_mappings[gid],
-                self.context_positions,
-                self._context_slot_mappings[i],
-                self.sample_indices,
-                self.sample_pos,
-                self.sample_idx_mapping,
-                input_batch,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                self.block_tables.input_block_tables[gid],
-                self.block_tables.kernel_block_sizes[gid],
-                self.parallel_drafting_token_id,
-                self.num_query_per_req,
-                self.num_speculative_steps,
-                self.max_num_reqs,
-                self.max_num_tokens,
-                self.max_model_len,
-                self.sample_from_anchor,
+        with nvtx_range(
+            f"dflash_draft_prepare_vi{vi}", generic="dflash_draft_prepare"
+        ):
+            # Support multiple draft KV cache groups by preparing inputs once for each
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.kernel_block_sizes[gid],
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
+
+            # Pre-insert context K/V into the cache. Runs eagerly outside the
+            # captured graph because the context shape varies per step. During
+            # dummy runs the block tables are placeholders, so we skip the cache
+            # write to avoid clobbering real entries. Each layer uses the context
+            # slots of its own kv-cache group.
+            if dummy_run:
+                context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+            elif self._layer_group_idx is not None:
+                context_slots = [
+                    self._context_slot_mappings[gidx][:num_target_tokens]
+                    for gidx in self._layer_group_idx
+                ]
+            else:
+                context_slots = self._context_slot_mappings[0][:num_target_tokens]
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
             )
 
-        # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
-        # because the context shape varies per step. During dummy runs the block tables
-        # are placeholders, so we skip the cache write to avoid clobbering real entries.
-        # Each layer uses the context slots of its own kv-cache group.
-        if dummy_run:
-            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-        elif self._layer_group_idx is not None:
-            context_slots = [
-                self._context_slot_mappings[gidx][:num_target_tokens]
-                for gidx in self._layer_group_idx
-            ]
-        else:
-            context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+            # Every DFlash step has exactly num_query_per_req tokens, so we can
+            # use FULL CGs
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.query_cudagraph_manager,
+                num_reqs,
+                num_query_tokens,
+                uniform_token_count=self.num_query_per_req,
+                dp_size=self.dp_size,
+                dp_rank=self.dp_rank,
+                need_eager=is_profile,
+            )
 
-        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_query_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-        )
+            num_reqs_padded = batch_desc.num_reqs or num_reqs
+            num_tokens_padded = batch_desc.num_tokens
 
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
-        num_tokens_padded = batch_desc.num_tokens
+            # Rebuild the draft attention metadata even when replaying the FULL
+            # graph so that any attention metadata builder state is updated.
+            draft_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                causal=self._group_causal,
+            )
+            draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                self.block_tables.slot_mappings[:, :num_tokens_padded],
+                self.kv_cache_config,
+            )
 
-        # Rebuild the draft attention metadata even when replaying the FULL
-        # graph so that any attention metadata builder state is updated.
-        draft_attn_metadata = self._build_draft_attn_metadata(
-            num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
-            causal=self._group_causal,
-        )
-        draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
-            self.block_tables.slot_mappings[:, :num_tokens_padded],
-            self.kv_cache_config,
-        )
-
-        # DFlash processes all speculative tokens in one forward pass,
-        # so the real token count is num_query_tokens.
-        self._prepare_eplb_forward(num_query_tokens)
+            # DFlash processes all speculative tokens in one forward pass,
+            # so the real token count is num_query_tokens.
+            self._prepare_eplb_forward(num_query_tokens)
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
-            self.query_cudagraph_manager.run_fullgraph(batch_desc)
+            # FULL CG includes draft sample; cannot split without logic change.
+            with nvtx_range(
+                f"dflash_draft_forward_vi{vi}", generic="dflash_draft_forward"
+            ):
+                self.query_cudagraph_manager.run_fullgraph(batch_desc)
         else:
             self._generate_draft(
                 num_reqs,
@@ -686,10 +710,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         if self.async_verify and (
             self._async_pending_req_ids is not None or self._probe_socket_busy()
         ):
-            torch.cuda.nvtx.range_push(
-                f"dflash_hs_nixl_async_catchup_wait_vi{vi}"
-            )
-            try:
+            with nvtx_range(
+                f"dflash_hs_nixl_async_catchup_wait_vi{vi}",
+                generic="dflash_hs_nixl_async_catchup_wait",
+            ):
                 if not self._resolve_async_remote_drafts(blocking=False):
                     self._resolve_async_remote_drafts(blocking=True)
                 if self._async_pending_req_ids is not None or self._probe_socket_busy():
@@ -697,8 +721,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                         "DFlash async remote-only: prior SPECulate still pending "
                         "after catchup; cannot kick a new batch"
                     )
-            finally:
-                torch.cuda.nvtx.range_pop()
             # Socket idle after catchup — send any FREEs deferred off execute start.
             self._flush_deferred_frees_if_idle()
 
@@ -727,47 +749,62 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._async_pending_req_ids = req_ids
                 self._async_pending_idx_mapping = idx_mapping_pending
                 self._async_pending_num_reqs = num_reqs
-            torch.cuda.nvtx.range_push(
-                f"dflash_hs_nixl_async_kick_vi{vi}_ki{ki}_n{num_reqs}"
-            )
-        try:
-            probe.begin_speculate(
-                self.hidden_states[:num_target_tokens],
-                req_ids=req_ids,
-                num_speculative_tokens=self.num_speculative_steps,
-                positions=input_batch.positions,
-                query_start_loc=input_batch.query_start_loc_np,
-                num_sampled=num_sampled,
-                num_rejected=num_rejected,
-                last_sampled=last_sampled,
-                next_prefill_tokens=next_prefill_tokens,
-                temperature=temperature,
-                seeds=seeds,
-                num_scheduled_tokens=input_batch.num_scheduled_tokens,
-                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-                idx_mapping=input_batch.idx_mapping_np,
-                src_ready_event=self._hs_ready_event,
-                defer_meta_sync=self.async_verify,
-                verify_step=vi,
-                kick_iter=ki,
-                on_speculate_reply=(
-                    self._on_async_speculate_reply if self.async_verify else None
-                ),
-            )
-        finally:
-            if self.async_verify:
-                torch.cuda.nvtx.range_pop()
-
-        if self.async_verify:
+            with nvtx_range(
+                f"dflash_hs_nixl_async_kick_vi{vi}_ki{ki}_n{num_reqs}",
+                generic="dflash_hs_nixl_async_kick",
+            ):
+                probe.begin_speculate(
+                    self.hidden_states[:num_target_tokens],
+                    req_ids=req_ids,
+                    num_speculative_tokens=self.num_speculative_steps,
+                    positions=input_batch.positions,
+                    query_start_loc=input_batch.query_start_loc_np,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                    last_sampled=last_sampled,
+                    next_prefill_tokens=next_prefill_tokens,
+                    temperature=temperature,
+                    seeds=seeds,
+                    num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    idx_mapping=input_batch.idx_mapping_np,
+                    src_ready_event=self._hs_ready_event,
+                    defer_meta_sync=True,
+                    verify_step=vi,
+                    kick_iter=ki,
+                    on_speculate_reply=self._on_async_speculate_reply,
+                )
             # Non-blocking: drafts arrive via bg recv callback / poll.
             return None
 
+        probe.begin_speculate(
+            self.hidden_states[:num_target_tokens],
+            req_ids=req_ids,
+            num_speculative_tokens=self.num_speculative_steps,
+            positions=input_batch.positions,
+            query_start_loc=input_batch.query_start_loc_np,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            temperature=temperature,
+            seeds=seeds,
+            num_scheduled_tokens=input_batch.num_scheduled_tokens,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            idx_mapping=input_batch.idx_mapping_np,
+            src_ready_event=self._hs_ready_event,
+            defer_meta_sync=False,
+            verify_step=vi,
+            kick_iter=ki,
+            on_speculate_reply=None,
+        )
+
         # CPU wait while GPU0 is idle — expected nsys hole until GPU1 finishes.
-        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_remote_wait_vi{vi}_ki{ki}")
-        try:
+        with nvtx_range(
+            f"dflash_hs_nixl_remote_wait_vi{vi}_ki{ki}",
+            generic="dflash_hs_nixl_remote_wait",
+        ):
             remote = probe.finish_speculate()
-        finally:
-            torch.cuda.nvtx.range_pop()
         if remote is None:
             raise RuntimeError("DFlash remote-only: SPECulate reply missing draft tokens")
         if remote.shape[0] != num_reqs or remote.shape[-1] != self.num_speculative_steps:
@@ -818,10 +855,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         if self.async_verify and busy:
             with self._async_lock:
                 self._async_deferred_free_ids |= exclude
-            torch.cuda.nvtx.range_push(
-                f"dflash_hs_nixl_free_deferred_n{len(exclude)}"
-            )
-            torch.cuda.nvtx.range_pop()
+            with nvtx_range(
+                f"dflash_hs_nixl_free_deferred_n{len(exclude)}",
+                generic="dflash_hs_nixl_free_deferred",
+            ):
+                pass
             return
 
         try:
@@ -851,8 +889,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             return
         probe = self._hs_nixl_probe
         assert probe is not None
-        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_deferred_free_n{len(ids)}")
-        try:
+        with nvtx_range(
+            f"dflash_hs_nixl_deferred_free_n{len(ids)}",
+            generic="dflash_hs_nixl_deferred_free",
+        ):
             try:
                 drained = probe.free(list(ids))
             except Exception:
@@ -862,8 +902,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.recover_async_drafts_after_socket_drain(
                     drained, exclude_req_ids=ids
                 )
-        finally:
-            torch.cuda.nvtx.range_pop()
 
     def _on_async_speculate_reply(self, remote: torch.Tensor) -> None:
         """Bg-thread callback: stash CPU drafts (side-channel publish is in stash).
@@ -1123,8 +1161,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         if not self.async_verify:
             return None
         vi = int(getattr(self, "last_verify_step", 0) or 0)
-        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_async_poll_vi{vi}")
-        try:
+        with nvtx_range(
+            f"dflash_hs_nixl_async_poll_vi{vi}",
+            generic="dflash_hs_nixl_async_poll",
+        ):
             self._resolve_async_remote_drafts(blocking=False)
             # After reply (or idle), send FREEs deferred off execute start.
             self._flush_deferred_frees_if_idle()
@@ -1132,8 +1172,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                 if not self._async_ready_queue:
                     return None
                 return self._async_ready_queue.pop(0)
-        finally:
-            torch.cuda.nvtx.range_pop()
 
     def defer_remote_dual_run(self, local_draft_tokens: torch.Tensor) -> None:
         """Mark remote SPECulate in-flight; do not recv yet (dual-run only).
@@ -1185,41 +1223,43 @@ class DFlashSpeculator(DraftModelSpeculator):
         if local is None:
             local = getattr(self, "_deferred_local_draft", None)
         vi = int(getattr(self, "last_verify_step", 0) or 0)
-        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_remote_wait_vi{vi}")
-        try:
+        with nvtx_range(
+            f"dflash_hs_nixl_remote_wait_vi{vi}",
+            generic="dflash_hs_nixl_remote_wait",
+        ):
             try:
-                remote = probe.finish_speculate()
-            except Exception:
-                logger.exception("DFlash dual-run finish_speculate failed")
-                return
-            if remote is None:
-                return
-            if local is None:
-                return
-            if tuple(remote.shape) != tuple(local.shape):
-                logger.warning(
-                    "DFlash dual-run shape mismatch: remote=%s local=%s "
-                    "(serving uses local drafts)",
-                    tuple(remote.shape),
-                    tuple(local.shape),
-                )
-                return
-            if not _dual_run_check_enabled(self.speculative_config):
-                return
-            # Expensive: H2D + torch.equal syncs — only when explicitly enabled.
-            remote_gpu = remote.to(device=local.device, dtype=local.dtype)
-            if not torch.equal(remote_gpu, local):
-                n_mismatch = int((remote_gpu != local).any(dim=-1).sum().item())
-                logger.warning(
-                    "DFlash dual-run mismatch: %d/%d reqs differ "
-                    "(serving uses local drafts)",
-                    n_mismatch,
-                    local.shape[0],
-                )
-        finally:
-            self._remote_dual_run_deferred = False
-            self._deferred_local_draft = None
-            torch.cuda.nvtx.range_pop()
+                try:
+                    remote = probe.finish_speculate()
+                except Exception:
+                    logger.exception("DFlash dual-run finish_speculate failed")
+                    return
+                if remote is None:
+                    return
+                if local is None:
+                    return
+                if tuple(remote.shape) != tuple(local.shape):
+                    logger.warning(
+                        "DFlash dual-run shape mismatch: remote=%s local=%s "
+                        "(serving uses local drafts)",
+                        tuple(remote.shape),
+                        tuple(local.shape),
+                    )
+                    return
+                if not _dual_run_check_enabled(self.speculative_config):
+                    return
+                # Expensive: H2D + torch.equal syncs — only when explicitly enabled.
+                remote_gpu = remote.to(device=local.device, dtype=local.dtype)
+                if not torch.equal(remote_gpu, local):
+                    n_mismatch = int((remote_gpu != local).any(dim=-1).sum().item())
+                    logger.warning(
+                        "DFlash dual-run mismatch: %d/%d reqs differ "
+                        "(serving uses local drafts)",
+                        n_mismatch,
+                        local.shape[0],
+                    )
+            finally:
+                self._remote_dual_run_deferred = False
+                self._deferred_local_draft = None
 
     def remote_cuda_profile(self, start: bool) -> None:
         """Mirror verify cudaProfilerStart/Stop onto the HS NIXL sink GPU."""

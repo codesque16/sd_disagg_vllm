@@ -58,6 +58,7 @@ from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.nvtx import nvtx_range
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -1226,7 +1227,8 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        # Outer generic NVTX name for nsys group-by; inner keeps i{N}_… detail.
+        with nvtx_range("execute_context"), self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )

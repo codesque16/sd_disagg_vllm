@@ -16,6 +16,7 @@ import zmq
 
 from vllm.distributed.nixl_utils import NixlWrapper, is_nixl_available, nixl_agent_config
 from vllm.logger import init_logger
+from vllm.profiler.nvtx import nvtx_range
 from vllm.v1.spec_decode.dflash_hs_nixl.protocol import (
     CMD_FREE,
     CMD_HELLO,
@@ -187,18 +188,19 @@ class HsNixlSink:
         def _wait_hiddens_ready() -> None:
             # Probe sends SPECulate meta first, then PtoP, then HS_READY.
             # CPU prep above overlaps the transfer; block here before touching HS.
-            torch.cuda.nvtx.range_push(f"dflash_sink_hs_wait{nvtx_suffix}")
-            try:
+            with nvtx_range(
+                f"dflash_sink_hs_wait{nvtx_suffix}", generic="dflash_sink_hs_wait"
+            ):
                 ready = self._sock.recv_multipart()
                 if len(ready) < 2:
                     raise RuntimeError("HS_READY: short multipart")
                 # ROUTER: [identity, payload]
                 decode_hs_ready(ready[1])
-            finally:
-                torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push(f"dflash_hs_nixl_speculate{nvtx_suffix}")
-        try:
+        with nvtx_range(
+            f"dflash_hs_nixl_speculate{nvtx_suffix}",
+            generic="dflash_hs_nixl_speculate",
+        ):
             draft_tokens = self._draft_runner.speculate(
                 req_ids=list(header["req_ids"]),
                 num_ctx_tokens=int(header["num_ctx_tokens"]),
@@ -207,8 +209,6 @@ class HsNixlSink:
             )
             reply = encode_speculate_response(draft_tokens)
             self._sock.send_multipart([identity, *reply])
-        finally:
-            torch.cuda.nvtx.range_pop()
 
     def _handle_free(self, identity: bytes, payload: bytes) -> None:
         if self._draft_runner is None:

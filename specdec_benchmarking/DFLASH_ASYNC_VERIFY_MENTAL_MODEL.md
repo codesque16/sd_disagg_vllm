@@ -341,7 +341,51 @@ T_exec_0 prepare_inputs:        T_exec_1 prepare_inputs:
 
 ---
 
-## 11. Perf note — mid-run GPU-idle `execute_context` gaps
+## 11. NVTX map (post-forward gap attribution)
+
+Pure instrumentation — no logic change. `execute_context` wraps the whole
+`execute_model` RPC (prep + target forward), **not** sampling or draft.
+
+Each numbered span is nested under a **generic** outer span with a stable name
+so nsys can group stats (`execute_context`, `sample`, `propose`,
+`dflash_draft_forward`, …) while the inner name keeps `i{N}` / `vi{N}` detail.
+
+**Colocated (local draft on verify GPU):**
+
+```
+execute_context
+  i{N}_execute_context_*        # prepare_inputs + target forward
+  (engine / sample_tokens RPC)  # CPU gap if unlabeled
+sample_tokens
+  i{N}_sample_tokens
+    sample / i{N}_sample        # logits + sample / rejection sample
+    postprocess_sampled / i{N}_postprocess_sampled
+    propose / i{N}_propose
+      dflash_hs_prep / …_vi{N}           # combine HS + DtoD into draft HS
+      dflash_draft_prepare / …_vi{N}     # prepare + context KV + CG meta
+      dflash_draft_forward / …_vi{N}     # draft forward (FULL CG may include sample)
+      dflash_draft_sample / …_vi{N}      # sample_draft (eager / piecewise only)
+```
+
+**Disagg / remote_only (draft on sink):**
+
+```
+execute_context / i{N}_execute_context_*
+sample_tokens / i{N}_sample_tokens
+  sample / i{N}_sample
+  propose / i{N}_propose
+    dflash_hs_prep / …_vi{N}
+    dflash_hs_nixl_*            # existing kick / meta_pack / stage / send / wait
+                                # (no dflash_draft_forward on verify GPU)
+```
+
+Draft forward on the sink remains under existing `dflash_hs_nixl_speculate*` /
+`dflash_sink_*` spans. Remaining hole between `execute_context` end and
+`sample_tokens` start is engine/RPC/grammar, not missing GPU work.
+
+---
+
+## 12. Perf note — mid-run GPU-idle `execute_context` gaps
 
 Long idle gaps inside verify `execute_context` (nsys: `posix_spawn` → `waitpid` → `cuModuleLoadData`) are usually **not** draft-wait (`blocked_0`). On gpt-oss they come from late Triton JIT of MoE routing:
 

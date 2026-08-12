@@ -33,6 +33,7 @@ from vllm.distributed.parallel_state import (
     init_distributed_environment,
 )
 from vllm.logger import init_logger
+from vllm.profiler.nvtx import nvtx_range
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.model_loader.weight_utils import (
@@ -595,8 +596,7 @@ class DFlashDraftRunner:
         device = self.device
         dirty_block_reqs: list[str] = []
         sfx = getattr(self, "_nvtx_suffix", "") or ""
-        torch.cuda.nvtx.range_push(f"dflash_sink_prep_cpu{sfx}")
-        try:
+        with nvtx_range(f"dflash_sink_prep_cpu{sfx}", generic="dflash_sink_prep_cpu"):
             def _host_1d(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
                 return t.detach().to(dtype=dtype).reshape(-1).contiguous()
 
@@ -651,18 +651,14 @@ class DFlashDraftRunner:
                 self._seqs[rid]["ctx_len"] = max(
                     int(self._seqs[rid]["ctx_len"]), last_valid + 1
                 )
-        finally:
-            torch.cuda.nvtx.range_pop()
 
         # Only flush slots that grew — one staged H2D like verify model_runner.
-        torch.cuda.nvtx.range_push(f"dflash_sink_pack_blocks{sfx}")
-        try:
+        with nvtx_range(
+            f"dflash_sink_pack_blocks{sfx}", generic="dflash_sink_pack_blocks"
+        ):
             self._flush_dirty_block_tables(dirty_block_reqs)
-        finally:
-            torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push(f"dflash_sink_h2d{sfx}")
-        try:
+        with nvtx_range(f"dflash_sink_h2d{sfx}", generic="dflash_sink_h2d"):
             # Patch durable buffers (slot-indexed like verify req_states).
             assert self._query_start_loc_buf is not None
             assert self._num_sampled_buf is not None
@@ -731,11 +727,8 @@ class DFlashDraftRunner:
                 max_seq_len + self.num_query_per_req, self.max_model_len
             )
             self.spec._copy_request_inputs(num_reqs, idx_mapping, temperature, seeds)
-        finally:
-            torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push(f"dflash_sink_prepare{sfx}")
-        try:
+        with nvtx_range(f"dflash_sink_prepare{sfx}", generic="dflash_sink_prepare"):
             # Densify durable slot tables → batch-ordered input_block_tables.
             # prepare_dflash indexes block_table by batch row (not slot); same as
             # colocated propose after model_runner.gather_block_tables.
@@ -766,14 +759,13 @@ class DFlashDraftRunner:
                     self.spec.max_model_len,
                     self.spec.sample_from_anchor,
                 )
-        finally:
-            torch.cuda.nvtx.range_pop()
 
         if wait_hiddens_ready is not None:
             wait_hiddens_ready()
 
-        torch.cuda.nvtx.range_push(f"dflash_sink_precompute{sfx}")
-        try:
+        with nvtx_range(
+            f"dflash_sink_precompute{sfx}", generic="dflash_sink_precompute"
+        ):
             if self.spec._layer_group_idx is not None:
                 context_slots: torch.Tensor | list[torch.Tensor | None] | None = [
                     self.spec._context_slot_mappings[gidx][:num_ctx_tokens]
@@ -786,11 +778,8 @@ class DFlashDraftRunner:
                 self.spec.context_positions[:num_ctx_tokens],
                 context_slots,
             )
-        finally:
-            torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push(f"dflash_sink_generate{sfx}")
-        try:
+        with nvtx_range(f"dflash_sink_generate{sfx}", generic="dflash_sink_generate"):
             num_query_tokens = num_reqs * self.spec.num_query_per_req
             batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
                 self.spec.query_cudagraph_manager,
@@ -827,5 +816,3 @@ class DFlashDraftRunner:
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
             return self.spec.draft_tokens[:num_reqs].clone()
-        finally:
-            torch.cuda.nvtx.range_pop()
