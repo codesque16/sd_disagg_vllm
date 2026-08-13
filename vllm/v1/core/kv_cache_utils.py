@@ -1816,17 +1816,125 @@ def generate_scheduler_kv_cache_config(
     return cfg
 
 
+def _kv_cache_group_type_name(spec: KVCacheSpec) -> str:
+    """Human-readable group type for capacity logs (e.g. FullAttention)."""
+    name = type(spec).__name__
+    if name.endswith("Spec"):
+        name = name[: -len("Spec")]
+    return name
+
+
+def _log_kv_cache_capacity_details(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    *,
+    max_concurrency: float,
+    logged_tokens: int,
+) -> None:
+    """Emit detailed capacity breakdown / per-group / math INFO lines."""
+    max_model_len = vllm_config.model_config.max_model_len
+    groups = kv_cache_config.kv_cache_groups
+    if not groups:
+        return
+
+    num_layer_per_group = max(len(group.layer_names) for group in groups)
+    page_size_bytes = groups[0].kv_cache_spec.page_size_bytes
+    memory_per_block = page_size_bytes * num_layer_per_group
+
+    group_bytes: list[int] = []
+    group_equiv_blocks: list[int] = []
+    for group in groups:
+        spec = group.kv_cache_spec
+        nbytes = spec.max_memory_usage_bytes(vllm_config)
+        group_bytes.append(nbytes)
+        group_equiv_blocks.append(cdiv(nbytes, spec.page_size_bytes))
+
+    num_block_per_request = sum(group_equiv_blocks)
+    sched = vllm_config.scheduler_config
+    max_batches = vllm_config.max_concurrent_batches
+    max_batched = sched.max_num_batched_tokens
+    max_in_flight = vllm_config.max_in_flight_tokens
+    logger.info_once(
+        "KV cache capacity breakdown: max_model_len=%s, "
+        "max_concurrent_batches=%s, max_num_batched_tokens=%s, "
+        "max_in_flight_tokens=%s (= batches × batched_tokens), "
+        "num_blocks=%s, group_size(num_layer_per_group)=%s, "
+        "page_size_bytes=%s, memory_per_block(group)=%s "
+        "(= page × group_size), num_kv_cache_groups=%s",
+        f"{max_model_len:,}",
+        f"{max_batches:,}",
+        f"{max_batched:,}",
+        f"{max_in_flight:,}",
+        f"{kv_cache_config.num_blocks:,}",
+        f"{num_layer_per_group:,}",
+        f"{page_size_bytes:,}",
+        f"{memory_per_block:,}",
+        f"{len(groups):,}",
+    )
+    for gi, group in enumerate(groups):
+        spec = group.kv_cache_spec
+        nbytes = group_bytes[gi]
+        g_page = spec.page_size_bytes
+        equiv_blocks = group_equiv_blocks[gi]
+        full_blocks = cdiv(max_model_len, spec.block_size)
+        logger.info_once(
+            "KV cache group[%d]: type=%s, layers=%d, block_size=%d, "
+            "page_size_bytes=%s, max_memory_usage_bytes=%s, "
+            "equiv_blocks(cdiv(bytes,page))=%d, full_tokens=L=%d, "
+            "full_blocks=cdiv(L, block_size)=cdiv(%d, %d)=%d",
+            gi,
+            _kv_cache_group_type_name(spec),
+            len(group.layer_names),
+            spec.block_size,
+            f"{g_page:,}",
+            f"{nbytes:,}",
+            equiv_blocks,
+            max_model_len,
+            max_model_len,
+            spec.block_size,
+            full_blocks,
+        )
+    equiv_sum = " + ".join(str(b) for b in group_equiv_blocks)
+    logger.info_once(
+        "KV cache capacity math: num_block_per_request = "
+        "sum_g cdiv(group_bytes, page) = %s = %d; "
+        "max_concurrency = num_blocks / num_block_per_request = "
+        "%s / %d = %.4f; "
+        "logged_tokens = max_concurrency × max_model_len = "
+        "%.4f × %s = %s "
+        "(display only; runtime admits via free blocks)",
+        equiv_sum if len(group_equiv_blocks) > 1 else str(num_block_per_request),
+        num_block_per_request,
+        f"{kv_cache_config.num_blocks:,}",
+        num_block_per_request,
+        max_concurrency,
+        max_concurrency,
+        f"{max_model_len:,}",
+        f"{logged_tokens:,}",
+    )
+
+
 def get_kv_cache_capacity(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> tuple[int, float]:
     """
     Get the group-aware KV cache token capacity and max concurrency.
+
+    Also emits the detailed capacity breakdown / per-group / math INFO lines
+    used at EngineCore startup.
     """
     max_model_len = vllm_config.model_config.max_model_len
     max_concurrency = get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     )
-    return int(max_concurrency * max_model_len), max_concurrency
+    logged_tokens = int(max_concurrency * max_model_len)
+    _log_kv_cache_capacity_details(
+        vllm_config,
+        kv_cache_config,
+        max_concurrency=max_concurrency,
+        logged_tokens=logged_tokens,
+    )
+    return logged_tokens, max_concurrency
 
 
 def _max_memory_usage_bytes_from_groups(
