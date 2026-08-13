@@ -235,6 +235,36 @@ class SpeculativeConfig:
     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
     Mutually exclusive with synthetic_acceptance_rates."""
 
+    # Milestone-0 HS probe: when set, colocated DFlash also NIXL-WRITEs
+    # hidden states to a sink process at this address.
+    disagg_dflash_address: str | None = None
+    """ZMQ address of the DFlash hidden-state NIXL sink
+    (e.g. ``tcp://127.0.0.1:50051``). When set with method=dflash, each
+    propose() transfers context hiddens via NIXL to that process.
+    With ``disagg_dflash_remote_only=False`` (Milestone-1 dual-run), draft
+    still runs on the verify GPU. With ``disagg_dflash_remote_only=True``
+    (Milestone-2), verify skips local draft kernels and serves remote tokens."""
+
+    disagg_dflash_remote_only: bool = False
+    """If True (with ``disagg_dflash_address``), verify does not load full
+    DFlash weights / draft KV and does not run local draft forward. It keeps
+    only the aux-HS ``fc`` projector (C1), kicks SPECulate to the sink, blocks
+    on ZMQ draft tokens, and uses those for serving."""
+
+    disagg_dflash_async_verify: bool = False
+    """If True (requires ``disagg_dflash_remote_only``), propose kicks the sink
+    SPECulate without waiting. Draft token ids are published to the scheduler
+    as real ``request.spec_token_ids`` when the ZMQ reply arrives; the
+    AsyncScheduler does not plant ``[-1]*K`` placeholders. Until ready, the
+    request is scheduled decode-1 (no speculative slots)."""
+
+    disagg_dflash_dual_run_check: bool = False
+    """If True (dual-run only), after receiving remote draft tokens compare
+    them to the local draft (``torch.equal``). Off by default — the compare
+    syncs the GPU and adds milliseconds of latency. Ignored when
+    ``disagg_dflash_remote_only`` is True. Override with env
+    ``VLLM_DFLASH_DUAL_RUN_CHECK=0|1``."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -1270,6 +1300,21 @@ class SpeculativeConfig:
 
         if not self.use_heterogeneous_vocab:
             self.verify_equal_vocab_size_if_draft_model()
+
+        if self.disagg_dflash_address is not None and self.method != "dflash":
+            raise ValueError(
+                "disagg_dflash_address is only supported with method='dflash'. "
+                f"Got method={self.method!r}."
+            )
+        if self.disagg_dflash_remote_only and self.disagg_dflash_address is None:
+            raise ValueError(
+                "disagg_dflash_remote_only requires disagg_dflash_address "
+                "(HS NIXL sink with draft enabled)."
+            )
+        if self.disagg_dflash_async_verify and not self.disagg_dflash_remote_only:
+            raise ValueError(
+                "disagg_dflash_async_verify requires disagg_dflash_remote_only=True."
+            )
         return self
 
     def verify_equal_vocab_size_if_draft_model(self):

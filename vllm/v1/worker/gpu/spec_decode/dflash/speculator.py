@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -8,6 +9,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.profiler.nvtx import nvtx_range
@@ -21,12 +23,25 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
-from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+from vllm.v1.worker.gpu.spec_decode.dflash.utils import (
+    load_dflash_fc_only,
+    load_dflash_model,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _dual_run_check_enabled(speculative_config: Any) -> bool:
+    """Env ``VLLM_DFLASH_DUAL_RUN_CHECK`` overrides speculative_config flag."""
+    import os
+
+    env = os.environ.get("VLLM_DFLASH_DUAL_RUN_CHECK")
+    if env is not None:
+        return env.strip().lower() in ("1", "true", "yes", "on")
+    return bool(getattr(speculative_config, "disagg_dflash_dual_run_check", False))
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -59,7 +74,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         # the anchor as the bonus token (only mask tokens predict); DSpark samples from
         # the anchor and the N-1 mask token positions. See _prepare_dflash_inputs_kernel
         self.sample_from_anchor = False
-        self.last_verify_step: int = 0
 
         # Context positions for the K/V precompute. Populated by
         # prepare_dflash_inputs, and processed by the model's
@@ -88,6 +102,83 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+        # Milestone-2: verify serves remote draft tokens; local draft skipped.
+        self.remote_only = bool(
+            getattr(self.speculative_config, "disagg_dflash_remote_only", False)
+        )
+        # Milestone-4: kick SPECulate without waiting; publish real draft ids
+        # when the ZMQ reply arrives (CPU ready signal + GPU buffer write).
+        self.async_verify = bool(
+            getattr(self.speculative_config, "disagg_dflash_async_verify", False)
+        )
+        # Set by model_runner.execute_model from SchedulerOutput.schedule_step
+        # so kick/poll NVTX ranges correlate with execute_i{N}_*.
+        self.last_verify_step: int = 0
+        self._nvtx_kick_iter: int = 0
+
+        # Milestone-0/1: optional NIXL HS (+ optional dual-run remote draft).
+        self._hs_nixl_probe = None
+        # Dual-run only: remote SPECulate recv deferred past next execute launch.
+        self._remote_dual_run_deferred = False
+        self._deferred_local_draft: torch.Tensor | None = None
+        # Async remote-only: one-deep in-flight SPECulate on the socket, plus a
+        # FIFO of ready draft batches (catchup before a new kick can land a
+        # reply while a prior poll has not yet drained the previous ready set).
+        self._async_lock = threading.Lock()
+        self._async_pending_req_ids: list[str] | None = None
+        self._async_pending_idx_mapping: torch.Tensor | None = None
+        self._async_pending_num_reqs: int = 0
+        # Fallback only when there is no side channel: (req_ids, idx, draft_cpu).
+        # With a side channel, stash publishes CPU ids only; prepare_inputs H2Ds.
+        self._async_ready_queue: list[
+            tuple[list[str], torch.Tensor, torch.Tensor]
+        ] = []
+        # Optional mp.Queue / queue.Queue: CPU draft ids for the engine without
+        # waiting on the worker RPC thread (set by executor/model_runner).
+        self._async_draft_side_queue: Any | None = None
+        # FREE while SPECulate is in flight: do not join the bg recv on the
+        # execute thread (Thread.join → sem_wait hole aligned with remote draft).
+        # Queue ids and send FREE once the socket is idle (after reply / poll).
+        self._async_deferred_free_ids: set[str] = set()
+        addr = self.speculative_config.disagg_dflash_address
+        # HS NIXL / ZMQ is 1-deep and owned by verify TP0 only. Non-TP0 ranks
+        # still combine HS and (async) install scheduled draft ids; they must
+        # not open a second DEALER against the sink. TP=1 is always rank 0.
+        if addr and get_tp_group().rank == 0:
+            from vllm.v1.spec_decode.dflash_hs_nixl import DFlashHsNixlProbe
+
+            self._hs_nixl_probe = DFlashHsNixlProbe(
+                addr,
+                max_tokens=self.max_num_tokens,
+                hidden_size=self.hidden_size,
+                dtype=self.dtype,
+                device=device,
+            )
+            if self.remote_only:
+                if self.async_verify:
+                    logger.info(
+                        "DFlash HS NIXL probe enabled (address=%s); "
+                        "remote-only async verify (non-blocking propose)",
+                        addr,
+                    )
+                else:
+                    logger.info(
+                        "DFlash HS NIXL probe enabled (address=%s); "
+                        "remote-only serving (no local draft forward)",
+                        addr,
+                    )
+            else:
+                logger.info(
+                    "DFlash HS NIXL probe enabled (address=%s); "
+                    "local draft still used for serving (dual-run)",
+                    addr,
+                )
+        elif addr:
+            logger.info(
+                "DFlash HS NIXL probe skipped on TP rank %s (TP0 owns sink)",
+                get_tp_group().rank,
+            )
+
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
@@ -100,6 +191,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.remote_only:
+            # Draft kernels / graphs live on the sink GPU.
+            self.query_cudagraph_manager = None
+            return
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
@@ -126,6 +221,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        if self.remote_only:
+            logger.info(
+                "Skipping %s CUDA graph capture on verify (remote-only draft).",
+                self._speculator_name,
+            )
+            return
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to zero to prevent stale values from prior
         # dummy runs from being baked into the captured graph.
@@ -149,6 +250,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
+        if self.remote_only:
+            return load_dflash_fc_only(self.vllm_config, self.device)
         return load_dflash_model(target_model, self.vllm_config)
 
     def set_attn(
@@ -159,6 +262,22 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
     ) -> None:
+        if self.remote_only:
+            # fc-only stub has no draft attention / KV on the verify GPU.
+            self.model_state = model_state
+            self.kv_cache_config = kv_cache_config
+            self.block_tables = block_tables
+            self.target_input_buffers = target_input_buffers
+            self.target_attn_groups = target_attn_groups
+            self.attn_groups = []
+            self.draft_attn_layer_names = set()
+            self.draft_kv_cache_group_ids = []
+            self.draft_kv_cache_group_id = -1
+            self._context_slot_mappings = None
+            self._layer_group_idx = None
+            self._group_causal = not self.requires_non_causal
+            return
+
         super().set_attn(
             model_state,
             kv_cache_config,
@@ -319,7 +438,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -340,9 +459,81 @@ class DFlashSpeculator(DraftModelSpeculator):
                 )
             else:
                 hidden_states = last_hidden_states
+            # Wait only until prior NIXL staging released the source HS — before
+            # overwrite. Do not join remote SPECulate recv for this barrier.
+            if (
+                self._hs_nixl_probe is not None
+                and self.async_verify
+                and not dummy_run
+            ):
+                self._hs_nixl_probe.wait_hs_src_released()
             self.hidden_states[:num_target_tokens].copy_(
                 hidden_states[:num_target_tokens]
             )
+
+        # Milestone-2 remote-only: kick SPECulate, block for draft tokens, skip
+        # local prepare/forward/sample (draft lives on the sink GPU).
+        # Milestone-4 async_verify: kick without wait; returns None until poll.
+        if self.remote_only:
+            if dummy_run:
+                # Memory/cudagraph warmup: no sink round-trip; no local draft.
+                return self.draft_tokens[:num_reqs]
+            # Non-TP0: no probe. Async drafts land via schedule + prepare_inputs.
+            if self._hs_nixl_probe is None:
+                if self.async_verify:
+                    return None
+                raise RuntimeError(
+                    "disagg_dflash_remote_only without a HS NIXL probe on this "
+                    "rank requires TP=1 or disagg_dflash_async_verify=true "
+                    "(non-TP0 cannot sync-wait on the sink)."
+                )
+            return self._propose_remote_only(
+                input_batch=input_batch,
+                num_reqs=num_reqs,
+                num_target_tokens=num_target_tokens,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                temperature=temperature,
+                seeds=seeds,
+            )
+
+        # After HS DtoD: kick NIXL(+SPECulate) on a side thread — do not wait.
+        # Dual-run: remote wait is deferred until the *next* propose so the
+        # worker can prepare/launch the next execute_context first.
+        if self._hs_nixl_probe is not None and not dummy_run:
+            # Complete previous step's remote recv (after batch N+1 was prepped).
+            self.finish_remote_dual_run()
+            if not self._hs_nixl_probe._handshook:
+                self._hs_nixl_probe.handshake()
+            if not hasattr(self, "_hs_ready_event"):
+                self._hs_ready_event = torch.cuda.Event()
+            self._hs_ready_event.record()
+            if self._hs_nixl_probe.draft_enabled:
+                self._hs_nixl_probe.begin_speculate(
+                    self.hidden_states[:num_target_tokens],
+                    req_ids=list(input_batch.req_ids[:num_reqs]),
+                    num_speculative_tokens=self.num_speculative_steps,
+                    positions=input_batch.positions,
+                    # Host mirrors — encode path never .cpu() these.
+                    query_start_loc=input_batch.query_start_loc_np,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                    last_sampled=last_sampled,
+                    next_prefill_tokens=next_prefill_tokens,
+                    temperature=temperature,
+                    seeds=seeds,
+                    num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    idx_mapping=input_batch.idx_mapping_np,
+                    src_ready_event=self._hs_ready_event,
+                )
+            else:
+                self._hs_nixl_probe.begin_transfer(
+                    self.hidden_states[:num_target_tokens],
+                    src_ready_event=self._hs_ready_event,
+                )
 
         self._copy_request_inputs(
             num_reqs,
@@ -477,6 +668,616 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
 
         return self.draft_tokens[:num_reqs]
+
+    def _propose_remote_only(
+        self,
+        *,
+        input_batch: InputBatch,
+        num_reqs: int,
+        num_target_tokens: int,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Kick sink SPECulate; sync waits for ZMQ, async returns None."""
+        probe = self._hs_nixl_probe
+        if probe is None:
+            raise RuntimeError(
+                "disagg_dflash_remote_only requires disagg_dflash_address "
+                "(HS NIXL probe was not created)."
+            )
+        if not probe._handshook:
+            probe.handshake()
+        if not probe.draft_enabled:
+            raise RuntimeError(
+                "disagg_dflash_remote_only requires a sink with draft enabled "
+                "(start dflash_hs_nixl_sink with --draft-model)."
+            )
+
+        # Socket is 1-deep: must resolve any prior async SPECulate before a new kick.
+        # Under wait-for-drafts (no decode-1), soft-skipping the kick deadlocks:
+        # the just-sampled batch never gets SPECulate and stays unscheduled forever
+        # (common with prefill-while-waiting or batch_queue overlap). Always catch
+        # up — non-blocking first, then block — and queue ready drafts for poll.
+        #
+        # Also join when the bg callback already cleared `_async_pending_req_ids`
+        # but `_bg_thread` has not been joined yet — otherwise begin_speculate
+        # raises "prior transfer/reply pending" on the next prefill kick.
+        vi = int(getattr(self, "last_verify_step", 0) or 0)
+        if self.async_verify and (
+            self._async_pending_req_ids is not None or self._probe_socket_busy()
+        ):
+            with nvtx_range(
+                f"dflash_hs_send_wait_vi{vi}",
+                generic="dflash_hs_send_wait",
+            ):
+                if not self._resolve_async_remote_drafts(blocking=False):
+                    self._resolve_async_remote_drafts(blocking=True)
+                if self._async_pending_req_ids is not None or self._probe_socket_busy():
+                    raise RuntimeError(
+                        "DFlash async remote-only: prior SPECulate still pending "
+                        "after catchup; cannot kick a new batch"
+                    )
+            # Socket idle after catchup — send any FREEs deferred off execute start.
+            self._flush_deferred_frees_if_idle()
+
+        if not hasattr(self, "_hs_ready_event"):
+            self._hs_ready_event = torch.cuda.Event()
+        self._hs_ready_event.record()
+        req_ids = list(input_batch.req_ids[:num_reqs])
+        self._nvtx_kick_iter += 1
+        ki = self._nvtx_kick_iter
+        # Capture pending mapping on CPU *before* begin_speculate: the bg reply
+        # callback may run before begin_speculate returns, and must not touch
+        # GPU tensors created on the execute thread.
+        idx_mapping_pending = None
+        if self.async_verify:
+            idx_np = getattr(input_batch, "idx_mapping_np", None)
+            if idx_np is not None:
+                idx_mapping_pending = torch.as_tensor(
+                    idx_np[:num_reqs], dtype=torch.long
+                ).contiguous()
+            else:
+                idx_mapping_pending = (
+                    input_batch.idx_mapping[:num_reqs].detach().to("cpu").contiguous()
+                )
+        if self.async_verify:
+            with self._async_lock:
+                self._async_pending_req_ids = req_ids
+                self._async_pending_idx_mapping = idx_mapping_pending
+                self._async_pending_num_reqs = num_reqs
+            with nvtx_range(
+                f"dflash_hs_send_vi{vi}_ki{ki}_n{num_reqs}",
+                generic="dflash_hs_send",
+            ):
+                probe.begin_speculate(
+                    self.hidden_states[:num_target_tokens],
+                    req_ids=req_ids,
+                    num_speculative_tokens=self.num_speculative_steps,
+                    positions=input_batch.positions,
+                    query_start_loc=input_batch.query_start_loc_np,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                    last_sampled=last_sampled,
+                    next_prefill_tokens=next_prefill_tokens,
+                    temperature=temperature,
+                    seeds=seeds,
+                    num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                    seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                    idx_mapping=input_batch.idx_mapping_np,
+                    src_ready_event=self._hs_ready_event,
+                    defer_meta_sync=True,
+                    verify_step=vi,
+                    kick_iter=ki,
+                    on_speculate_reply=self._on_async_speculate_reply,
+                )
+            # Non-blocking: drafts arrive via bg recv callback / poll.
+            return None
+
+        with nvtx_range(
+            f"dflash_hs_send_vi{vi}_ki{ki}_n{num_reqs}",
+            generic="dflash_hs_send",
+        ):
+            probe.begin_speculate(
+                self.hidden_states[:num_target_tokens],
+                req_ids=req_ids,
+                num_speculative_tokens=self.num_speculative_steps,
+                positions=input_batch.positions,
+                query_start_loc=input_batch.query_start_loc_np,
+                num_sampled=num_sampled,
+                num_rejected=num_rejected,
+                last_sampled=last_sampled,
+                next_prefill_tokens=next_prefill_tokens,
+                temperature=temperature,
+                seeds=seeds,
+                num_scheduled_tokens=input_batch.num_scheduled_tokens,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                idx_mapping=input_batch.idx_mapping_np,
+                src_ready_event=self._hs_ready_event,
+                defer_meta_sync=False,
+                verify_step=vi,
+                kick_iter=ki,
+                on_speculate_reply=None,
+            )
+
+        # CPU wait while GPU0 is idle — expected nsys hole until GPU1 finishes.
+        with nvtx_range(
+            f"dflash_draft_recv_vi{vi}_ki{ki}",
+            generic="dflash_draft_recv",
+        ):
+            remote = probe.finish_speculate()
+        if remote is None:
+            raise RuntimeError("DFlash remote-only: SPECulate reply missing draft tokens")
+        if remote.shape[0] != num_reqs or remote.shape[-1] != self.num_speculative_steps:
+            raise RuntimeError(
+                "DFlash remote-only: unexpected draft_tokens shape "
+                f"{tuple(remote.shape)} (expected ({num_reqs}, "
+                f"{self.num_speculative_steps}))"
+            )
+        remote_gpu = remote.to(
+            device=self.draft_tokens.device, dtype=self.draft_tokens.dtype
+        )
+        self.draft_tokens[:num_reqs].copy_(remote_gpu)
+        return self.draft_tokens[:num_reqs]
+
+    def set_async_draft_side_channel(self, side_queue: Any | None) -> None:
+        """Wire engine-visible CPU draft publish (GPU install stays on poll)."""
+        self._async_draft_side_queue = side_queue
+
+    def _probe_socket_busy(self) -> bool:
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return False
+        return (
+            probe._bg_thread is not None
+            or getattr(probe, "_speculate_pending", False)
+        )
+
+    def free_remote_kv(self, req_ids: set[str]) -> None:
+        """FREE draft-side KV without joining an in-flight SPECulate on execute.
+
+        If the DEALER socket is busy, defer the FREE until after the reply
+        (flushed from poll / catchup). Joining here was the nsys ``sem_wait``
+        hole aligned with ``speculate_recv``.
+        """
+        exclude = set(req_ids)
+        if not exclude:
+            return
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+
+        # Drop dead reqs from local async bookkeeping immediately.
+        self._prune_async_ready_queue(exclude)
+
+        busy = self._probe_socket_busy() or (
+            self._async_pending_req_ids is not None
+        )
+        if self.async_verify and busy:
+            with self._async_lock:
+                self._async_deferred_free_ids |= exclude
+            with nvtx_range(
+                f"dflash_hs_nixl_free_deferred_n{len(exclude)}",
+                generic="dflash_hs_nixl_free_deferred",
+            ):
+                pass
+            return
+
+        try:
+            drained = probe.free(list(exclude))
+        except Exception:
+            logger.exception("DFlash HS NIXL FREE failed")
+            drained = None
+        else:
+            self._remote_dual_run_deferred = False
+            self._deferred_local_draft = None
+            if self.async_verify:
+                self.recover_async_drafts_after_socket_drain(
+                    drained, exclude_req_ids=exclude
+                )
+
+    def _flush_deferred_frees_if_idle(self) -> None:
+        """Send any deferred FREEs once the SPECulate socket is idle."""
+        with self._async_lock:
+            if not self._async_deferred_free_ids:
+                return
+        if self._probe_socket_busy() or self._async_pending_req_ids is not None:
+            return
+        with self._async_lock:
+            ids = set(self._async_deferred_free_ids)
+            self._async_deferred_free_ids.clear()
+        if not ids:
+            return
+        probe = self._hs_nixl_probe
+        assert probe is not None
+        with nvtx_range(
+            f"dflash_hs_nixl_deferred_free_n{len(ids)}",
+            generic="dflash_hs_nixl_deferred_free",
+        ):
+            try:
+                drained = probe.free(list(ids))
+            except Exception:
+                logger.exception("DFlash HS NIXL deferred FREE failed")
+                drained = None
+            else:
+                self.recover_async_drafts_after_socket_drain(
+                    drained, exclude_req_ids=ids
+                )
+
+    def _on_async_speculate_reply(self, remote: torch.Tensor) -> None:
+        """Bg-thread callback: stash CPU drafts (side-channel publish is in stash).
+
+        Do **not** install into ``req_states.draft_tokens`` here. The bg thread
+        has a different CUDA default stream than the worker execute thread; a
+        non-blocking H2D on this stream is not ordered against verify's
+        ``combine_sampled_and_draft_tokens``, which produced 0% acceptance.
+        GPU install stays on ``poll_async_remote_drafts`` (worker RPC thread).
+        """
+        with self._async_lock:
+            req_ids = self._async_pending_req_ids
+            idx_mapping = self._async_pending_idx_mapping
+            if req_ids is None or idx_mapping is None:
+                return
+            # Drop drafts for reqs with deferred FREE (finished while in flight).
+            exclude = set(self._async_deferred_free_ids)
+            if exclude:
+                keep = [i for i, r in enumerate(req_ids) if r not in exclude]
+                if not keep:
+                    self._async_pending_req_ids = None
+                    self._async_pending_idx_mapping = None
+                    self._async_pending_num_reqs = 0
+                    return
+                t = torch.tensor(keep, dtype=torch.long)
+                self._stash_async_ready_drafts(
+                    req_ids=[req_ids[i] for i in keep],
+                    idx_mapping=idx_mapping[t],
+                    remote=remote[t],
+                    already_locked=True,
+                )
+            else:
+                self._stash_async_ready_drafts(
+                    req_ids=req_ids,
+                    idx_mapping=idx_mapping,
+                    remote=remote,
+                    already_locked=True,
+                )
+
+    def _publish_async_draft_side(
+        self, req_ids: list[str], draft_ids: list[list[int]]
+    ) -> bool:
+        """Wake the engine with CPU draft ids. Returns True if enqueued.
+
+        Blocks if the queue is full so the wake is never dropped.
+        """
+        side_q = self._async_draft_side_queue
+        if side_q is None:
+            return False
+        payload = (list(req_ids), draft_ids)
+        try:
+            side_q.put_nowait(payload)
+            return True
+        except Exception:
+            try:
+                side_q.put(payload)
+                return True
+            except Exception:
+                logger.exception(
+                    "DFlash async: side-channel publish failed after stash"
+                )
+                return False
+
+    def _stash_async_ready_drafts(
+        self,
+        *,
+        req_ids: list[str],
+        idx_mapping: torch.Tensor,
+        remote: torch.Tensor,
+        already_locked: bool = False,
+    ) -> None:
+        """Validate ZMQ drafts and wake the engine with CPU ids.
+
+        With a side channel: publish only (no ready-queue / no CUDA). The
+        scheduler gets real ``spec_token_ids``; ``prepare_inputs`` H2Ds them on
+        the execute stream. That keeps engine schedule overlapped with the
+        prior GPU batch (no poll-time ``cudaStreamSynchronize``).
+
+        Without a side channel: enqueue CPU drafts for a CUDA-free RPC poll.
+        """
+
+        publish: tuple[list[str], list[list[int]]] | None = None
+
+        def _do() -> None:
+            nonlocal publish
+            num_reqs = len(req_ids)
+            if (
+                remote.shape[0] != num_reqs
+                or remote.shape[-1] != self.num_speculative_steps
+            ):
+                raise RuntimeError(
+                    "DFlash async remote-only: unexpected draft_tokens shape "
+                    f"{tuple(remote.shape)} (expected ({num_reqs}, "
+                    f"{self.num_speculative_steps}))"
+                )
+            if remote.device.type != "cpu":
+                remote_cpu = remote.detach().to(
+                    dtype=self.draft_tokens.dtype, device="cpu"
+                ).contiguous()
+            else:
+                remote_cpu = remote.detach().to(
+                    dtype=self.draft_tokens.dtype
+                ).contiguous()
+
+            if idx_mapping.device.type != "cpu":
+                idx_host = idx_mapping.detach().to(device="cpu").contiguous()
+            else:
+                idx_host = idx_mapping.detach().contiguous()
+
+            self._async_pending_req_ids = None
+            self._async_pending_idx_mapping = None
+            self._async_pending_num_reqs = 0
+            publish = (list(req_ids), remote_cpu.tolist())
+            # Ready queue only when there is no side channel (poll fallback).
+            if self._async_draft_side_queue is None:
+                self._async_ready_queue.append((req_ids, idx_host, remote_cpu))
+
+        if already_locked:
+            _do()
+        else:
+            with self._async_lock:
+                _do()
+        if publish is not None and self._async_draft_side_queue is not None:
+            # Blocking put inside publish — must not fail under normal load.
+            self._publish_async_draft_side(publish[0], publish[1])
+
+    def _resolve_async_remote_drafts(self, *, blocking: bool) -> bool:
+        """Try to complete an in-flight async SPECulate. Returns True if idle for kick.
+
+        Idle means: no tracked pending batch **and** probe bg/socket not busy.
+        The bg reply callback may clear `_async_pending_req_ids` before the
+        transfer thread exits; we still must join before the next kick.
+        """
+        probe = self._hs_nixl_probe
+        with self._async_lock:
+            pending = self._async_pending_req_ids is not None
+        if not pending:
+            if probe is None or not self._probe_socket_busy():
+                return True
+            # Pending already stashed/dropped; only need to join the bg thread.
+            if blocking:
+                probe.finish_speculate()
+                return not self._probe_socket_busy()
+            # Reply already consumed by callback path; join if thread has exited.
+            probe.try_finish_speculate()
+            return not self._probe_socket_busy()
+
+        if probe is None:
+            return False
+        if blocking:
+            remote = probe.finish_speculate()
+        else:
+            remote = probe.try_finish_speculate()
+        # Bg callback may have stashed while we joined/recv'd.
+        with self._async_lock:
+            if self._async_pending_req_ids is None:
+                return not self._probe_socket_busy()
+        if remote is None:
+            # Not ready yet, or drained by FREE while we still tracked pending.
+            if blocking:
+                with self._async_lock:
+                    self._async_pending_req_ids = None
+                    self._async_pending_idx_mapping = None
+                    self._async_pending_num_reqs = 0
+                return not self._probe_socket_busy()
+            return False
+        with self._async_lock:
+            if self._async_pending_req_ids is None:
+                return not self._probe_socket_busy()
+            assert self._async_pending_idx_mapping is not None
+            self._stash_async_ready_drafts(
+                req_ids=self._async_pending_req_ids,
+                idx_mapping=self._async_pending_idx_mapping,
+                remote=remote,
+                already_locked=True,
+            )
+        return not self._probe_socket_busy()
+
+    def clear_async_draft_state(self) -> None:
+        """Drop in-flight / ready async draft bookkeeping (shutdown / hard reset)."""
+        self._async_pending_req_ids = None
+        self._async_pending_idx_mapping = None
+        self._async_pending_num_reqs = 0
+        self._async_ready_queue.clear()
+        self._async_deferred_free_ids.clear()
+
+    def recover_async_drafts_after_socket_drain(
+        self,
+        remote: torch.Tensor | None,
+        *,
+        exclude_req_ids: set[str] | None = None,
+    ) -> None:
+        """Stash a SPECulate reply drained by FREE/PROFILE for still-running reqs.
+
+        FREE/PROFILE must clear the 1-deep DEALER socket before their own
+        command. Under wait-for-drafts, dropping that reply (or clearing the
+        ready queue) deadlocks survivors that were in the drained batch.
+        """
+        exclude = exclude_req_ids or set()
+        if (
+            remote is not None
+            and self._async_pending_req_ids is not None
+            and self._async_pending_idx_mapping is not None
+        ):
+            req_ids = self._async_pending_req_ids
+            idx_mapping = self._async_pending_idx_mapping
+            keep = [i for i, r in enumerate(req_ids) if r not in exclude]
+            if not keep:
+                self._async_pending_req_ids = None
+                self._async_pending_idx_mapping = None
+                self._async_pending_num_reqs = 0
+            elif len(keep) == len(req_ids):
+                self._stash_async_ready_drafts(
+                    req_ids=req_ids,
+                    idx_mapping=idx_mapping,
+                    remote=remote,
+                )
+            else:
+                t = torch.tensor(keep, dtype=torch.long)
+                self._stash_async_ready_drafts(
+                    req_ids=[req_ids[i] for i in keep],
+                    idx_mapping=idx_mapping[t],
+                    remote=remote[t],
+                )
+        if exclude:
+            self._prune_async_ready_queue(exclude)
+
+    def _prune_async_ready_queue(self, exclude_req_ids: set[str]) -> None:
+        if not self._async_ready_queue or not exclude_req_ids:
+            return
+        pruned: list[tuple[list[str], torch.Tensor, torch.Tensor]] = []
+        for req_ids, idx_mapping, draft_cpu in self._async_ready_queue:
+            keep = [i for i, r in enumerate(req_ids) if r not in exclude_req_ids]
+            if not keep:
+                continue
+            if len(keep) == len(req_ids):
+                pruned.append((req_ids, idx_mapping, draft_cpu))
+                continue
+            t = torch.tensor(keep, dtype=torch.long)
+            pruned.append(
+                (
+                    [req_ids[i] for i in keep],
+                    idx_mapping[t],
+                    draft_cpu[t],
+                )
+            )
+        self._async_ready_queue = pruned
+
+    def poll_async_remote_drafts(
+        self,
+    ) -> tuple[list[str], torch.Tensor, torch.Tensor] | None:
+        """Non-blocking take of ready async drafts for GPU install + CPU publish.
+
+        Returns ``(req_ids, idx_mapping_cpu, draft_tokens_cpu)`` or None.
+        Caller (worker thread) performs H2D into ``req_states.draft_tokens``.
+        """
+        if not self.async_verify:
+            return None
+        vi = int(getattr(self, "last_verify_step", 0) or 0)
+        with nvtx_range(
+            f"dflash_draft_recv_vi{vi}",
+            generic="dflash_draft_recv",
+        ):
+            self._resolve_async_remote_drafts(blocking=False)
+            # After reply (or idle), send FREEs deferred off execute start.
+            self._flush_deferred_frees_if_idle()
+            with self._async_lock:
+                if not self._async_ready_queue:
+                    return None
+                return self._async_ready_queue.pop(0)
+
+    def defer_remote_dual_run(self, local_draft_tokens: torch.Tensor) -> None:
+        """Mark remote SPECulate in-flight; do not recv yet (dual-run only).
+
+        Serving already has ``local_draft_tokens``. Waiting is deferred to
+        ``finish_remote_dual_run`` at the start of the next propose so the
+        worker can prepare/launch the next batch first.
+        """
+        if self.remote_only:
+            return
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+        if probe._bg_thread is None and not getattr(probe, "_speculate_pending", False):
+            return
+        self._remote_dual_run_deferred = True
+        # Clone only if we will compare later (buffer is reused next step).
+        if _dual_run_check_enabled(self.speculative_config):
+            self._deferred_local_draft = local_draft_tokens.detach().clone()
+        else:
+            self._deferred_local_draft = None
+
+    def finish_remote_dual_run(
+        self, local_draft_tokens: torch.Tensor | None = None
+    ) -> None:
+        """Recv GPU1 draft tokens for a previously deferred dual-run step.
+
+        Called at the start of the next propose (after next execute was able to
+        be prepared/launched). Serving still uses local drafts only.
+
+        This wait is CPU-side (ZMQ recv). A CUDA-stream wait would need NIXL
+        WRITE of tokens into a GPU0 buffer + event signaling instead of ZMQ.
+
+        Token match check is off by default (see
+        ``disagg_dflash_dual_run_check`` / ``VLLM_DFLASH_DUAL_RUN_CHECK``).
+        """
+        if self.remote_only:
+            return
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+        pending = bool(getattr(self, "_remote_dual_run_deferred", False)) or (
+            probe._bg_thread is not None
+            or getattr(probe, "_speculate_pending", False)
+        )
+        if not pending:
+            return
+        local = local_draft_tokens
+        if local is None:
+            local = getattr(self, "_deferred_local_draft", None)
+        vi = int(getattr(self, "last_verify_step", 0) or 0)
+        with nvtx_range(
+            f"dflash_draft_recv_vi{vi}",
+            generic="dflash_draft_recv",
+        ):
+            try:
+                try:
+                    remote = probe.finish_speculate()
+                except Exception:
+                    logger.exception("DFlash dual-run finish_speculate failed")
+                    return
+                if remote is None:
+                    return
+                if local is None:
+                    return
+                if tuple(remote.shape) != tuple(local.shape):
+                    logger.warning(
+                        "DFlash dual-run shape mismatch: remote=%s local=%s "
+                        "(serving uses local drafts)",
+                        tuple(remote.shape),
+                        tuple(local.shape),
+                    )
+                    return
+                if not _dual_run_check_enabled(self.speculative_config):
+                    return
+                # Expensive: H2D + torch.equal syncs — only when explicitly enabled.
+                remote_gpu = remote.to(device=local.device, dtype=local.dtype)
+                if not torch.equal(remote_gpu, local):
+                    n_mismatch = int((remote_gpu != local).any(dim=-1).sum().item())
+                    logger.warning(
+                        "DFlash dual-run mismatch: %d/%d reqs differ "
+                        "(serving uses local drafts)",
+                        n_mismatch,
+                        local.shape[0],
+                    )
+            finally:
+                self._remote_dual_run_deferred = False
+                self._deferred_local_draft = None
+
+    def remote_cuda_profile(self, start: bool) -> None:
+        """Mirror verify cudaProfilerStart/Stop onto the HS NIXL sink GPU."""
+        probe = self._hs_nixl_probe
+        if probe is None:
+            return
+        try:
+            # PROFILE may drain an in-flight SPECulate on the DEALER socket.
+            drained = probe.profile(start)
+            if self.async_verify:
+                # Stash drained drafts; do not wipe the ready queue.
+                self.recover_async_drafts_after_socket_drain(drained)
+        except Exception as e:
+            logger.warning("DFlash HS NIXL remote PROFILE failed: %s", e)
 
 
 @triton.jit

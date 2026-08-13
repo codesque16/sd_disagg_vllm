@@ -85,7 +85,12 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
-from .gpu.warmup import warmup_kernels
+from .gpu.warmup import (
+    warmup_kernels,
+    warmup_mixed_batch_kernels,
+    warmup_prefill_kernels,
+    warmup_uniform_decode_kernels,
+)
 from .utils import request_memory
 
 logger = init_logger(__name__)
@@ -862,6 +867,20 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            # Dense target-only uniform-decode sweep so MoE/routing Triton
+            # specializations for every decode batch size compile before
+            # jit_monitor activates. Does not wait on a remote draft sink
+            # (dummy_run propose path). Covers sizes above cudagraph capture
+            # (e.g. gen=131→1048 when capture max is 1024) that previously
+            # paid posix_spawn/waitpid stalls inside execute_context.
+            warmup_uniform_decode_kernels(self.model_runner)
+            # Prefill/non-uniform + mixed batches: first live traffic and PD2
+            # disagg steps still JIT'd _topk_forward / bitmatrix / nonpow2
+            # routing after uniform-only warmup.
+            warmup_prefill_kernels(self.model_runner)
+            warmup_mixed_batch_kernels(
+                self.model_runner, self.execute_model, self.sample_tokens
+            )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -996,6 +1015,44 @@ class Worker(WorkerBase):
 
         iteration_details = compute_iteration_details(scheduler_output)
 
+        schedule_step = int(getattr(scheduler_output, "schedule_step", 0) or 0)
+        draft_ready_reqs = int(
+            getattr(scheduler_output, "num_draft_ready_reqs", 0) or 0
+        )
+        draft_ready_tokens = int(
+            getattr(scheduler_output, "num_draft_ready_tokens", 0) or 0
+        )
+        draft_blocked_reqs = int(
+            getattr(scheduler_output, "num_draft_blocked_reqs", 0) or 0
+        )
+        sched_draft_reqs = int(
+            getattr(scheduler_output, "num_scheduled_draft_reqs", 0) or 0
+        )
+        sched_draft_tokens = int(
+            getattr(scheduler_output, "num_scheduled_draft_tokens", 0) or 0
+        )
+        prev_spec_step = int(
+            getattr(scheduler_output, "prev_spec_schedule_step", 0) or 0
+        )
+        prev_spec_drafts = int(getattr(scheduler_output, "prev_spec_num_drafts", 0) or 0)
+        prev_spec_draft = int(
+            getattr(scheduler_output, "prev_spec_draft_tokens", 0) or 0
+        )
+        prev_spec_acc = int(
+            getattr(scheduler_output, "prev_spec_accepted_tokens", 0) or 0
+        )
+        prev_spec_rej = int(
+            getattr(scheduler_output, "prev_spec_rejected_tokens", 0) or 0
+        )
+        draft_suffix = (
+            f"_draft_ready_{draft_ready_reqs}({draft_ready_tokens})"
+            f"_blocked_{draft_blocked_reqs}"
+            f"_sched_{sched_draft_reqs}({sched_draft_tokens})"
+            f"_prev_i{prev_spec_step}"
+            f"_acc_{prev_spec_acc}_rej_{prev_spec_rej}"
+            f"_draft_{prev_spec_draft}_n{prev_spec_drafts}"
+        )
+
         if self.vllm_config.profiler_config.detailed_trace_annotation:
             # Compute roofline-model metrics per request, split by phase
             # (context vs generation). These help estimate compute and
@@ -1054,7 +1111,9 @@ class Worker(WorkerBase):
                     gen_qk_compute += query_len * seq_len
             annotation = "".join(
                 [
-                    "execute_",
+                    "i",
+                    str(schedule_step),
+                    "_execute_",
                     str(total_scheduled_tokens),
                     "_context_",
                     str(iteration_details.num_ctx_requests),
@@ -1077,12 +1136,15 @@ class Worker(WorkerBase):
                     "sqsk",
                     str(gen_qk_compute),
                     ")",
+                    draft_suffix,
                 ]
             )
         else:
             annotation = "".join(
                 [
-                    "execute_context_",
+                    "i",
+                    str(schedule_step),
+                    "_execute_context_",
                     str(iteration_details.num_ctx_requests),
                     "(",
                     str(iteration_details.num_ctx_tokens),
@@ -1092,6 +1154,7 @@ class Worker(WorkerBase):
                     "(",
                     str(iteration_details.num_generation_tokens),
                     ")",
+                    draft_suffix,
                 ]
             )
         return self.profiler.annotate_context_manager(annotation)
@@ -1164,19 +1227,8 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        # Nested NVTX: outer generic for nsys stats; inner i{N}_… for manual match.
-        vi = int(getattr(self, "_nvtx_execute_step", 0) or 0) + 1
-        self._nvtx_execute_step = vi
-        if hasattr(self.model_runner, "_nvtx_schedule_step"):
-            self.model_runner._nvtx_schedule_step = vi
-        else:
-            setattr(self.model_runner, "_nvtx_schedule_step", vi)
-        spec = getattr(self.model_runner, "speculator", None)
-        if spec is not None:
-            setattr(spec, "last_verify_step", vi)
-        with nvtx_range(
-            f"i{vi}_execute_context", generic="execute_context"
-        ), self.annotate_profile(scheduler_output):
+        # Outer generic NVTX name for nsys group-by; inner keeps i{N}_… detail.
+        with nvtx_range("execute_context"), self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
@@ -1209,6 +1261,15 @@ class Worker(WorkerBase):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()
+
+    def poll_async_remote_drafts(self) -> DraftTokenIds | None:
+        if hasattr(self.model_runner, "poll_async_remote_drafts"):
+            return self.model_runner.poll_async_remote_drafts()
+        return None
+
+    def set_async_draft_side_queue(self, side_queue) -> None:
+        if hasattr(self.model_runner, "set_async_draft_side_queue"):
+            self.model_runner.set_async_draft_side_queue(side_queue)
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         # Check if profiling is enabled
@@ -1257,11 +1318,23 @@ class Worker(WorkerBase):
             # If profiler already initialized, restart profiling but keep
             # the original trace name from the first initialization.
             self.profiler.start()
+            self._maybe_remote_hs_nixl_cuda_profile(is_start=True)
         else:
             if self.profiler is None:
                 logger.warning("Profiler was not started, nothing to stop.")
                 return
             self.profiler.stop()
+            self._maybe_remote_hs_nixl_cuda_profile(is_start=False)
+
+    def _maybe_remote_hs_nixl_cuda_profile(self, *, is_start: bool) -> None:
+        """Keep sink GPU inside the same nsys cudaProfilerApi window as verify."""
+        try:
+            speculator = getattr(self.model_runner, "speculator", None)
+            remote = getattr(speculator, "remote_cuda_profile", None)
+            if callable(remote):
+                remote(is_start)
+        except Exception as e:
+            logger.warning("DFlash HS NIXL remote cuda profile notify failed: %s", e)
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

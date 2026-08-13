@@ -18,6 +18,7 @@ from multiprocessing.queues import Queue
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -225,6 +226,11 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        spec_cfg = vllm_config.speculative_config
+        self.disagg_dflash_async_verify = bool(
+            spec_cfg is not None
+            and getattr(spec_cfg, "disagg_dflash_async_verify", False)
+        )
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -584,7 +590,18 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        # Publish ready remote drafts before scheduling so decode can run
+        # 1+K (never decode-1 while waiting on GPU1).
+        self._poll_async_remote_drafts()
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        # All decodes draft-blocked and no new prefills: skip empty execute
+        # unless the worker still needs bookkeeping (finished/preempted frees).
+        # Skipping those leaks req_states slots → "No free indices".
+        if (
+            scheduler_output.total_num_scheduled_tokens == 0
+            and not self._scheduler_output_needs_worker(scheduler_output)
+        ):
+            return {}, False
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -605,11 +622,60 @@ class EngineCore:
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    def _poll_async_remote_drafts(self) -> None:
+        """Publish ready async remote drafts into request.spec_token_ids.
+
+        Side channel carries CPU draft ids for the scheduler without a worker
+        RPC. GPU ``req_states.draft_tokens`` are installed later in
+        ``prepare_inputs`` from those scheduled ids (execute stream) so this
+        path must not CUDA-sync against an in-flight batch.
+
+        With a side channel: drain CPU ids only; skip worker RPC (ready queue
+        is not used on that path). Without a side channel: CUDA-free RPC poll
+        for CPU ids only.
+        """
+        if not self.disagg_dflash_async_verify:
+            return
+        got_side = False
+        while True:
+            draft_token_ids = self.model_executor.try_recv_async_remote_drafts()
+            if draft_token_ids is None:
+                break
+            got_side = True
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+        if self.model_executor.has_async_draft_side_channel:
+            # Happy path: scheduler has real draft ids; prepare will H2D.
+            # Do not RPC-poll — that used to cudaStreamSynchronize on the
+            # worker and blocked overlapping the next schedule with GPU work.
+            return
+        draft_token_ids = self.model_executor.poll_async_remote_drafts()
+        if draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
+    @staticmethod
+    def _scheduler_output_needs_worker(scheduler_output: SchedulerOutput) -> bool:
+        """True if an otherwise-empty schedule still must hit the worker.
+
+        ``schedule()`` clears ``finished_req_ids`` into the output; if we skip
+        ``execute_model``, those frees never run and req_states slots leak.
+        """
+        if scheduler_output.finished_req_ids:
+            return True
+        if scheduler_output.preempted_req_ids:
+            return True
+        if scheduler_output.free_encoder_mm_hashes:
+            return True
+        return False
+
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
+        # Async remote verify: always poll (even when idle waiting on drafts
+        # with no execute) so the next schedule can unblock 1+K.
+        if self.disagg_dflash_async_verify:
+            self._poll_async_remote_drafts()
+        elif self.check_for_draft_tokens and not self.async_scheduling and model_executed:
             draft_token_ids = self.model_executor.take_draft_token_ids()
             if draft_token_ids is not None:
                 self.scheduler.update_draft_token_ids(draft_token_ids)
@@ -642,41 +708,61 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            self._poll_async_remote_drafts()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
-
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
+            skip_empty = (
+                self.disagg_dflash_async_verify
+                and scheduler_output.total_num_scheduled_tokens == 0
+                and not self._scheduler_output_needs_worker(scheduler_output)
+            )
+            if skip_empty:
+                # Draft-blocked only: no tokens and no worker frees to apply.
+                if not batch_queue:
+                    return None, False
+                # Bounded wait on the oldest in-flight result: if it completes,
+                # fall through and collect (launch-before-long-sync). If not,
+                # return and retry so we can poll drafts / schedule without
+                # blocking this thread on cudaStreamSynchronize indefinitely.
+                # NOTE: Multiproc FutureWrapper.done() is false until result()
+                # drains the MQ — must use result(timeout=), not done().
+                try:
+                    batch_queue[-1][0].result(timeout=0.001)
+                except TimeoutError:
+                    return None, False
             else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
+                with self.log_error_detail(scheduler_output):
+                    exec_future = self.model_executor.execute_model(
+                        scheduler_output, non_block=True
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                if self.is_ec_consumer:
+                    model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, model_executed
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled / bookkeeping-only).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # Defer sampling until prior-step model output is processed.
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()
+                    ):
+                        # Don't block on next worker response unless the queue is full
+                        # or there are no more requests to schedule.
+                        return None, model_executed
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -690,7 +776,12 @@ class EngineCore:
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            # NVTX: attribute nsys CUDA API under this range (Event vs Stream).
+            torch.cuda.nvtx.range_push("engine_collect_sample_output")
+            try:
+                model_output = future.result()
+            finally:
+                torch.cuda.nvtx.range_pop()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
