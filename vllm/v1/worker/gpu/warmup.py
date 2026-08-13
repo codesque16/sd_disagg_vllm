@@ -11,7 +11,7 @@ import torch
 from vllm import PoolingParams, SamplingParams
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -23,6 +23,195 @@ from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 logger = init_logger(__name__)
+
+
+def _uniform_decode_warmup_sizes(model_runner: GPUModelRunner) -> list[int]:
+    """Token counts for target-only uniform-decode warmup.
+
+    Dense-sweeps every legal request count ``1..max_num_reqs`` (each size is a
+    multiple of ``decode_query_len``). A pow2/cudagraph-only set misses common
+    live decode batches just above the cudagraph capture cap (e.g. gen=131 →
+    1048 tokens when capture max is 1024), which then pay Triton MoE routing
+    JIT (``_topk_forward`` / bitmatrix / ``_combined_routing_compute_pow2``)
+    and ``posix_spawn``/``waitpid`` stalls inside ``execute_context``.
+    """
+    decode_query_len = model_runner.decode_query_len
+    if decode_query_len <= 0:
+        return []
+
+    max_num_reqs = model_runner.max_num_reqs
+    max_tokens = min(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        max_num_reqs * decode_query_len,
+    )
+    max_tokens = (max_tokens // decode_query_len) * decode_query_len
+    if max_tokens < decode_query_len:
+        return []
+
+    max_reqs_for_budget = max_tokens // decode_query_len
+    sizes: set[int] = {
+        num_reqs * decode_query_len
+        for num_reqs in range(1, max_reqs_for_budget + 1)
+    }
+
+    # Keep cudagraph-rounded sizes too (no-ops if already covered).
+    cg_sizes = model_runner.vllm_config.compilation_config.cudagraph_capture_sizes
+    if cg_sizes:
+        for size in cg_sizes:
+            rounded = round_up(size, decode_query_len)
+            if decode_query_len <= rounded <= max_tokens:
+                sizes.add(rounded)
+
+    return sorted(sizes, reverse=True)
+
+
+def _prefill_warmup_sizes(model_runner: GPUModelRunner) -> list[int]:
+    """Non-uniform token counts that exercise prefill / mixed MoE routing.
+
+    First live traffic after ready often JITs ``_topk_forward`` on prefill-sized
+    batches that uniform-decode warmup never hits. Cover compile-range ends,
+    cudagraph sizes (as eager prefill), and a few large chunk sizes seen in
+    PD2S1 nsys (e.g. ~5k scheduled tokens).
+    """
+    max_bt = model_runner.scheduler_config.max_num_batched_tokens
+    if max_bt <= 0:
+        return []
+
+    sizes: set[int] = {1, max_bt}
+    for size in (
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        5000,
+        7520,
+        max_bt // 2,
+        max_bt // 4 * 3,
+    ):
+        if 1 <= size <= max_bt:
+            sizes.add(size)
+
+    cg_sizes = model_runner.vllm_config.compilation_config.cudagraph_capture_sizes
+    if cg_sizes:
+        for size in cg_sizes:
+            if 1 <= size <= max_bt:
+                sizes.add(size)
+
+    for compile_range in model_runner.vllm_config.compilation_config.get_compile_ranges():
+        end = int(compile_range.end)
+        if 1 <= end <= max_bt:
+            sizes.add(end)
+
+    return sorted(sizes, reverse=True)
+
+
+def _mixed_batch_warmup_sizes(model_runner: GPUModelRunner) -> list[int]:
+    """Representative total token counts for mixed prefill+decode steps."""
+    max_bt = model_runner.scheduler_config.max_num_batched_tokens
+    if max_bt < 3:
+        return []
+
+    sizes: set[int] = {max_bt}
+    for size in (256, 1024, 2048, 4096, 5000, 7520, max_bt // 2):
+        if 3 <= size <= max_bt:
+            sizes.add(size)
+    return sorted(sizes, reverse=True)
+
+
+@torch.inference_mode()
+def warmup_uniform_decode_kernels(model_runner: GPUModelRunner) -> None:
+    """JIT target-side Triton kernels for uniform decode batch sizes.
+
+    Uses `_dummy_run(..., uniform_decode=True)` so only the verify/target
+    forward is exercised (speculator propose runs with dummy_run=True and does
+    not wait on a remote draft sink).
+    """
+    if model_runner.is_pooling_model:
+        return
+
+    sizes = _uniform_decode_warmup_sizes(model_runner)
+    if not sizes:
+        return
+
+    logger.info(
+        "Warming up %d uniform-decode target sizes for Triton JIT "
+        "(decode_query_len=%d, max=%d, dense req sweep).",
+        len(sizes),
+        model_runner.decode_query_len,
+        sizes[0],
+    )
+    for num_tokens in sizes:
+        model_runner._dummy_run(
+            num_tokens,
+            uniform_decode=True,
+            skip_eplb=True,
+        )
+    torch.accelerator.synchronize()
+
+
+@torch.inference_mode()
+def warmup_prefill_kernels(model_runner: GPUModelRunner) -> None:
+    """JIT MoE routing for non-uniform / prefill-shaped batches via dummy_run."""
+    if model_runner.is_pooling_model:
+        return
+
+    sizes = _prefill_warmup_sizes(model_runner)
+    if not sizes:
+        return
+
+    logger.info(
+        "Warming up %d prefill/non-uniform target sizes for Triton JIT (max=%d).",
+        len(sizes),
+        sizes[0],
+    )
+    for num_tokens in sizes:
+        model_runner._dummy_run(
+            num_tokens,
+            uniform_decode=False,
+            skip_eplb=True,
+        )
+    torch.accelerator.synchronize()
+
+
+@torch.inference_mode()
+def warmup_mixed_batch_kernels(
+    model_runner: GPUModelRunner,
+    worker_execute_model: Callable[[SchedulerOutput], Any],
+    worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+) -> None:
+    """JIT mixed prefill+decode scheduler steps seen in PD disagg nsys gaps."""
+    if model_runner.is_pooling_model:
+        return
+
+    sizes = _mixed_batch_warmup_sizes(model_runner)
+    if not sizes:
+        return
+
+    logger.info(
+        "Warming up %d mixed prefill+decode sizes for Triton JIT (max=%d).",
+        len(sizes),
+        sizes[0],
+    )
+    warmed = 0
+    for i, num_tokens in enumerate(sizes):
+        ok = run_mixed_prefill_decode_warmup(
+            model_runner,
+            worker_execute_model,
+            worker_sample_tokens,
+            num_tokens,
+            req_id_prefix=f"_v2_mixed_warmup_{i}",
+        )
+        if ok:
+            warmed += 1
+    if warmed:
+        torch.accelerator.synchronize()
+    logger.info("Mixed prefill+decode warmup completed for %d/%d sizes.", warmed, len(sizes))
 
 
 def run_mixed_prefill_decode_warmup(
