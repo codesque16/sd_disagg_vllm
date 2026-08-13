@@ -83,6 +83,9 @@ NSYS_RUN_TS=""
 NSYS_COMBINED_OUT=""
 # Pass vLLM --numa-bind with fixed TP=4 CPU pin map (cpus 0-103 → 4 equal groups).
 NUMA_BIND=0
+# Roofline: short-circuit colocated DFlash propose after stage 1/2/3.
+# Empty = normal propose. See speculative_config.skip_dflash_stage.
+SKIP_DFLASH_STAGE=""
 
 # Synthetic acceptance rates used in prior PD*S* sweeps.
 SYNTH_RATES='[0.9184485330681254,0.8179331856606844,0.7422584874101532,0.6783825324352425,0.6191175805795398,0.5591293341169025,0.49742326296279554]'
@@ -159,6 +162,11 @@ Options:
                            splitting host CPUs 0-103 into 4 equal groups
                            (0-25 26-51 52-77 78-103). Applied to each vllm
                            serve whose tensor-parallel-size is 4.
+  --skip-dflash-stage N    Roofline (colocated DFlash): set
+                           speculative_config.skip_dflash_stage=N (1|2|3).
+                           1=dummy return in hs_prep; 2=hs_prep then skip
+                           prepare/forward; 3=hs_prep+prepare, skip forward.
+                           Target sample + synthetic reject unchanged.
   --proxy                  Also launch toy_proxy_server.py on --proxy-port
   --proxy-port PORT        Client-facing proxy port (default 8000)
   --proxy-script PATH      Override path to toy_proxy_server.py
@@ -369,6 +377,13 @@ reject_sample_json_fields() {
   fi
 }
 
+skip_dflash_json_field() {
+  # Optional ,"skip_dflash_stage":N for colocated roofline ablations.
+  if [[ -n "$SKIP_DFLASH_STAGE" ]]; then
+    printf ',"skip_dflash_stage":%s' "$SKIP_DFLASH_STAGE"
+  fi
+}
+
 spec_json() {
   local draft_tp="$1"
   # Colocated SD: set draft_tensor_parallel_size.
@@ -387,12 +402,14 @@ spec_json() {
       # async verify requires remote-only.
       async_verify="false"
     fi
-    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_remote_only":%s,"disagg_dflash_dual_run_check":%s,"disagg_dflash_async_verify":%s}' \
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s,"disagg_dflash_address":"%s","disagg_dflash_remote_only":%s,"disagg_dflash_dual_run_check":%s,"disagg_dflash_async_verify":%s%s}' \
       "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)" \
-      "$DRAFT_ADDR" "$remote_only" "$dual_check" "$async_verify"
+      "$DRAFT_ADDR" "$remote_only" "$dual_check" "$async_verify" \
+      "$(skip_dflash_json_field)"
   else
-    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s}' \
-      "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)"
+    printf '{"method":"dflash","model":"%s","num_speculative_tokens":%s,"draft_tensor_parallel_size":%s,%s%s}' \
+      "$DRAFT_MODEL" "$NUM_SPEC_TOKENS" "$draft_tp" "$(reject_sample_json_fields)" \
+      "$(skip_dflash_json_field)"
   fi
 }
 
@@ -973,6 +990,14 @@ while [[ $# -gt 0 ]]; do
     --no-synthetic) USE_SYNTHETIC=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
     --numa-bind) NUMA_BIND=1; shift ;;
+    --skip-dflash-stage|--skip_dflash_stage)
+      SKIP_DFLASH_STAGE="${2:?}"
+      case "$SKIP_DFLASH_STAGE" in
+        1|2|3) ;;
+        *) die "--skip-dflash-stage must be 1, 2, or 3 (got ${SKIP_DFLASH_STAGE})" ;;
+      esac
+      shift 2
+      ;;
     --nsys) NSYS=1; shift ;;
     --nsys-dir) NSYS_DIR="${2:?}"; NSYS_DIR_SET=1; shift 2 ;;
     --nsys-delay) NSYS_DELAY="${2:?}"; shift 2 ;;
@@ -1026,6 +1051,9 @@ if [[ "$MODE" == sd_disagg || "$MODE" == colocated_sd || "$MODE" == disagg_sd ]]
   else
     echo "# rejection_sample=standard (real draft↔target reject; curl-friendly)"
   fi
+fi
+if [[ -n "$SKIP_DFLASH_STAGE" ]]; then
+  echo "# skip_dflash_stage=${SKIP_DFLASH_STAGE} (roofline: dummy drafts after that propose stage)"
 fi
 if [[ "$NSYS" -eq 1 ]]; then
   # --nsys-dir > env NSYS_DIR > bench_results/<tag>/nsys

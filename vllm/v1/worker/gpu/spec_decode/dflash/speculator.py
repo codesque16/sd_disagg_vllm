@@ -60,6 +60,20 @@ class DFlashSpeculator(DraftModelSpeculator):
         # the anchor and the N-1 mask token positions. See _prepare_dflash_inputs_kernel
         self.sample_from_anchor = False
         self.last_verify_step: int = 0
+        # Roofline: short-circuit propose after stage 1/2/3 (see skip_dflash_stage).
+        self.skip_dflash_stage: int | None = getattr(
+            self.speculative_config, "skip_dflash_stage", None
+        )
+        if self.skip_dflash_stage is not None:
+            logger.warning(
+                "DFlash skip_dflash_stage=%s enabled (roofline): propose will "
+                "return dummy draft tokens after that stage; not for quality.",
+                self.skip_dflash_stage,
+            )
+        # Roofline ablation: short-circuit propose after stage 1/2/3 (see config).
+        self.skip_dflash_stage: int | None = getattr(
+            self.speculative_config, "skip_dflash_stage", None
+        )
 
         # Context positions for the K/V precompute. Populated by
         # prepare_dflash_inputs, and processed by the model's
@@ -333,7 +347,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         vi = int(getattr(self, "last_verify_step", 0) or 0)
+        # Roofline short-circuit (serving path only — keep dummy_run for CG/warmup).
+        skip_stage = None if dummy_run else self.skip_dflash_stage
+
         with nvtx_range(f"dflash_hs_prep_vi{vi}", generic="dflash_hs_prep"):
+            if skip_stage == 1:
+                # Stage 1: do nothing — tiny span for nsys, dummy drafts out.
+                return self._dummy_draft_tokens(num_reqs)
             if aux_hidden_states:
                 hidden_states = self.model.combine_hidden_states(
                     torch.cat(aux_hidden_states, dim=-1)
@@ -350,6 +370,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             temperature,
             seeds,
         )
+
+        if skip_stage == 2:
+            # Stage 2: hs_prep done; instant return inside prepare span.
+            with nvtx_range(
+                f"dflash_draft_prepare_vi{vi}", generic="dflash_draft_prepare"
+            ):
+                return self._dummy_draft_tokens(num_reqs)
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -459,6 +486,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             # so the real token count is num_query_tokens.
             self._prepare_eplb_forward(num_query_tokens)
 
+        if skip_stage == 3:
+            # Stage 3: prepare done; skip draft forward/sample.
+            with nvtx_range(
+                f"dflash_draft_forward_vi{vi}", generic="dflash_draft_forward"
+            ):
+                return self._dummy_draft_tokens(num_reqs)
+
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             # FULL CG includes draft sample; cannot split without logic change.
@@ -476,6 +510,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
+        return self.draft_tokens[:num_reqs]
+
+    def _dummy_draft_tokens(self, num_reqs: int) -> torch.Tensor:
+        """Fill and return draft_tokens with zeros for skip_dflash_stage paths."""
+        self.draft_tokens[:num_reqs].zero_()
         return self.draft_tokens[:num_reqs]
 
 

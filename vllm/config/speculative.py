@@ -235,6 +235,17 @@ class SpeculativeConfig:
     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
     Mutually exclusive with synthetic_acceptance_rates."""
 
+    skip_dflash_stage: int | None = Field(default=None, ge=1, le=3)
+    """Roofline / ablation: short-circuit colocated DFlash ``propose`` after
+    the given stage (ignored during dummy_run / cudagraph warmup).
+
+    * ``1`` — return dummy drafts immediately (tiny ``dflash_hs_prep`` only)
+    * ``2`` — run ``dflash_hs_prep``, then return (skip prepare + forward)
+    * ``3`` — run ``dflash_hs_prep`` + ``dflash_draft_prepare``, skip forward
+
+    Target sample / synthetic rejection outside propose are unchanged.
+    Only valid with ``method='dflash'``. ``None`` = normal propose."""
+
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
@@ -1249,6 +1260,11 @@ class SpeculativeConfig:
             raise ValueError(
                 "synthetic_acceptance_rates / synthetic_acceptance_length "
                 "are only valid with rejection_sample_method='synthetic'."
+            )
+
+        if self.skip_dflash_stage is not None and self.method != "dflash":
+            raise ValueError(
+                "skip_dflash_stage is only supported with method='dflash'."
             )
 
         if self.draft_model_config:
