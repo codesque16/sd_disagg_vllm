@@ -26,6 +26,41 @@ from vllm.v1.request import Request, RequestStatus
 logger = init_logger(__name__)
 
 
+def _kv_cache_trace_enabled() -> bool:
+    from vllm import envs
+
+    return bool(envs.VLLM_KV_CACHE_TRACE)
+
+
+def _kv_cache_trace_phase(
+    request: "Request | None" = None,
+    *,
+    num_lookahead_tokens: int = 0,
+) -> str:
+    """Resolve the phase tag for a [KV] trace line.
+
+    ``VLLM_KV_CACHE_TRACE_PHASE=auto`` (default) classifies each call:
+      - PREFILL: still consuming the prompt
+      - VERIFY: speculative lookahead / draft tokens present
+      - DECODE: normal token generation
+    Any other env value is used as a fixed label for every line.
+    """
+    from vllm import envs
+
+    configured = str(envs.VLLM_KV_CACHE_TRACE_PHASE).strip()
+    if configured.lower() != "auto":
+        return configured or "DECODE"
+
+    if request is None:
+        return "DECODE"
+
+    if request.num_computed_tokens < request.num_prompt_tokens:
+        return "PREFILL"
+    if num_lookahead_tokens > 0 or bool(getattr(request, "spec_token_ids", None)):
+        return "VERIFY"
+    return "DECODE"
+
+
 @dataclass
 class KVCacheBlocks:
     """
@@ -183,6 +218,64 @@ class KVCacheManager:
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
 
+    def _kv_trace_pool_used(self) -> tuple[int, int]:
+        """Return ``(used_blocks, usable_blocks)`` excluding the null block."""
+        usable = max(self.block_pool.num_gpu_blocks - 1, 0)
+        free = self.block_pool.get_num_free_blocks()
+        used = max(usable - free, 0)
+        return used, usable
+
+    def _kv_trace_held(self, request_id: str) -> list[int]:
+        """Per-group non-null block counts currently held by ``request_id``."""
+        held: list[int] = []
+        for mgr in self.coordinator.single_type_managers:
+            blocks = mgr.req_to_blocks.get(request_id, [])
+            held.append(sum(1 for b in blocks if not b.is_null))
+        return held
+
+    def _kv_trace_emit(
+        self,
+        *,
+        action: str,
+        request_id: str,
+        before_held: list[int],
+        after_held: list[int],
+        before_used: int,
+        phase: str,
+        reason: str | None = None,
+    ) -> None:
+        """Print one ``[KV] [ALLOCATED|FREED]`` line (EngineCore-prefixed)."""
+        after_used, usable = self._kv_trace_pool_used()
+        delta_total = after_used - before_used
+        if delta_total == 0 and all(a == b for a, b in zip(after_held, before_held)):
+            return
+
+        if action == "ALLOCATED":
+            tag = "[KV] [ALLOCATED]"
+        else:
+            tag = "[KV] [FREED]    "
+
+        pct = (100.0 * after_used / usable) if usable else 0.0
+        group_parts: list[str] = []
+        for gi, (before, after) in enumerate(zip(before_held, after_held)):
+            kind = (
+                self.kv_cache_event_metadata[gi][0]
+                if gi < len(self.kv_cache_event_metadata)
+                else "unknown"
+            )
+            group_parts.append(
+                f"g{gi}:{kind} {after - before:+d} (held={after})"
+            )
+        line = (
+            f"{tag} │ {phase} │ req={request_id} │ "
+            f"{delta_total:+d} blocks │ used={after_used}/{usable} "
+            f"({pct:.1f}%) │ " + " │ ".join(group_parts)
+        )
+        if reason:
+            line = f"{line} │ {reason}"
+        # print() so decorate_logs adds "(EngineCore pid=...)" like the sample.
+        print(line, flush=True)
+
     @property
     def usage(self) -> float:
         """Get the KV cache usage.
@@ -191,6 +284,14 @@ class KVCacheManager:
             The KV cache usage (between 0.0 and 1.0).
         """
         return self.block_pool.get_usage()
+
+    def get_kv_cache_block_size_bytes(self) -> int:
+        """Bytes per block in the shared KV pool (all tensor groups)."""
+        num_blocks = int(self.kv_cache_config.num_blocks)
+        if num_blocks <= 0:
+            return 0
+        total = sum(int(t.size) for t in self.kv_cache_config.kv_cache_tensors)
+        return total // num_blocks
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -440,11 +541,31 @@ class KVCacheManager:
         # Free on the processed-token basis: in-flight steps' attention windows
         # still read blocks below the optimistic boundary, and rejected spec
         # tokens can roll it back.
+        trace = _kv_cache_trace_enabled()
+        if trace:
+            phase = _kv_cache_trace_phase(
+                request, num_lookahead_tokens=num_lookahead_tokens
+            )
+            before_held = self._kv_trace_held(request.request_id)
+            before_used, _ = self._kv_trace_pool_used()
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             max(0, total_computed_tokens - request.num_in_flight_tokens),
             num_prompt_tokens=request.num_prompt_tokens,
         )
+        if trace:
+            after_trim_held = self._kv_trace_held(request.request_id)
+            self._kv_trace_emit(
+                action="FREED",
+                request_id=request.request_id,
+                before_held=before_held,
+                after_held=after_trim_held,
+                before_used=before_used,
+                phase=phase,
+                reason="trim",
+            )
+            before_held = after_trim_held
+            before_used, _ = self._kv_trace_pool_used()
 
         num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
             request_id=request.request_id,
@@ -485,6 +606,16 @@ class KVCacheManager:
             num_encoder_tokens,
         )
 
+        if trace:
+            self._kv_trace_emit(
+                action="ALLOCATED",
+                request_id=request.request_id,
+                before_held=before_held,
+                after_held=self._kv_trace_held(request.request_id),
+                before_used=before_used,
+                phase=phase,
+            )
+
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
         if not self.enable_caching or delay_cache_blocks:
@@ -511,7 +642,21 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
-        self.coordinator.free(request.request_id)
+        if _kv_cache_trace_enabled():
+            before_held = self._kv_trace_held(request.request_id)
+            before_used, _ = self._kv_trace_pool_used()
+            phase = _kv_cache_trace_phase(request)
+            self.coordinator.free(request.request_id)
+            self._kv_trace_emit(
+                action="FREED",
+                request_id=request.request_id,
+                before_held=before_held,
+                after_held=self._kv_trace_held(request.request_id),
+                before_used=before_used,
+                phase=phase,
+            )
+        else:
+            self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
         self,
@@ -528,9 +673,25 @@ class KVCacheManager:
                 fully processed and committed tokens only (safe to free).
             num_prompt_tokens: Optional prompt length for R-SWA gap eviction.
         """
-        self.coordinator.remove_skipped_blocks(
-            request_id, processed_computed_tokens, num_prompt_tokens
-        )
+        if _kv_cache_trace_enabled():
+            before_held = self._kv_trace_held(request_id)
+            before_used, _ = self._kv_trace_pool_used()
+            self.coordinator.remove_skipped_blocks(
+                request_id, processed_computed_tokens, num_prompt_tokens
+            )
+            self._kv_trace_emit(
+                action="FREED",
+                request_id=request_id,
+                before_held=before_held,
+                after_held=self._kv_trace_held(request_id),
+                before_used=before_used,
+                phase=_kv_cache_trace_phase(),
+                reason="trim",
+            )
+        else:
+            self.coordinator.remove_skipped_blocks(
+                request_id, processed_computed_tokens, num_prompt_tokens
+            )
 
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without

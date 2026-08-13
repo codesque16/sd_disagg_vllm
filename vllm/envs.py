@@ -223,6 +223,10 @@ if TYPE_CHECKING:
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
+    # Emit per-request [KV] ALLOCATED/FREED traces (EngineCore stdout).
+    VLLM_KV_CACHE_TRACE: bool = False
+    # Phase label in [KV] traces: "auto" (PREFILL/DECODE/VERIFY) or a fixed tag.
+    VLLM_KV_CACHE_TRACE_PHASE: str = "auto"
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
@@ -1688,6 +1692,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # implement and support a subset of all possible layouts.
     "VLLM_KV_CACHE_LAYOUT": env_with_choices(
         "VLLM_KV_CACHE_LAYOUT", None, ["NHD", "HND"]
+    ),
+    # Print per-request [KV] ALLOCATED / FREED lines (very verbose).
+    "VLLM_KV_CACHE_TRACE": lambda: bool(
+        int(os.getenv("VLLM_KV_CACHE_TRACE", "0"))
+    ),
+    # Phase tag in [KV] traces. "auto" picks PREFILL / DECODE / VERIFY per call;
+    # any other value is printed as a fixed label.
+    "VLLM_KV_CACHE_TRACE_PHASE": lambda: os.getenv(
+        "VLLM_KV_CACHE_TRACE_PHASE", "auto"
     ),
     # SSM conv state layout used for Mamba models.
     # - SD: (state_len, dim) — dim contiguous (default)
