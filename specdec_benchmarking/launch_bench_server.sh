@@ -81,7 +81,7 @@ NSYS_RUN_TS=""
 # PV*S* Disagg-DFlash: one nsys profile over a parent that starts draft+verify
 # → single combined .nsys-rep (nsys start/launch multi-process is flaky on 2025.1).
 NSYS_COMBINED_OUT=""
-# Pass vLLM --numa-bind with fixed TP=4 CPU pin map (cpus 0-103 → 4 equal groups).
+# Pass vLLM --numa-bind with fixed TP=4 / TP=8 pin maps (h100x8 NUMA topo).
 NUMA_BIND=0
 # Roofline: short-circuit colocated DFlash propose after stage 1/2/3.
 # Empty = normal propose. See speculative_config.skip_dflash_stage.
@@ -106,8 +106,8 @@ ENABLE_LOGGING_ITERATION_DETAILS=0
 EXTRA_ARGS=()
 
 CASES=(
-  PD1 PD2 PD4
-  PD1S1 PD2S2 PD4S4
+  PD1 PD2 PD4 PD8
+  PD1S1 PD2S2 PD4S4 PD8S1
   PD2S1 PD4S1
   P1_D1 P2_D2
   P1_D1S1 P2_D2S2 P2_D2S1
@@ -157,11 +157,13 @@ Options:
                            Use for curl quality checks on PV*S* / PD*S*.
   --enable-disagg-profile  Opt-in SD timing + Disagg/DFlash profile logs
                            (CUDA sync — skews latency; off by default for benches)
-  --numa-bind              TP=4 only: add vLLM --numa-bind with
-                           --numa-bind-nodes 0 0 0 0 and --numa-bind-cpus
-                           splitting host CPUs 0-103 into 4 equal groups
-                           (0-25 26-51 52-77 78-103). Applied to each vllm
-                           serve whose tensor-parallel-size is 4.
+  --numa-bind              TP=4 or TP=8: add vLLM --numa-bind matching
+                           h100x8 topo (GPU0-3→NUMA0, GPU4-7→NUMA1).
+                           TP=4: nodes 0 0 0 0; CPUs from NUMA0
+                           (0-51,104-155) in 4 equal groups.
+                           TP=8: nodes 0 0 0 0 1 1 1 1; CPUs split across
+                           both NUMA nodes (primary+HT). Applied to each
+                           vllm serve whose tensor-parallel-size is 4 or 8.
   --skip-dflash-stage N    Roofline (colocated DFlash): set
                            speculative_config.skip_dflash_stage=N (1|2|3).
                            1=dummy return in hs_prep; 2=hs_prep then skip
@@ -309,6 +311,7 @@ default_devices_for_tp() {
     1) echo "0" ;;
     2) echo "0,1" ;;
     4) echo "0,1,2,3" ;;
+    8) echo "0,1,2,3,4,5,6,7" ;;
     *)
       local ids=()
       local i
@@ -347,23 +350,55 @@ count_csv() {
 }
 
 # Sets NUMA_BIND_ARGS for a vllm serve with the given TP. Empty if --numa-bind
-# was not requested. Currently TP=4 only: all ranks on NUMA node 0, CPUs 0-103
-# split into four equal ranges.
+# was not requested.
+#
+# Pin map for h100x8 (nvidia-smi topo):
+#   GPU0-3 → NUMA 0, CPUs 0-51,104-155
+#   GPU4-7 → NUMA 1, CPUs 52-103,156-207
+# Each GPU gets 13 primary + 13 HT CPUs (26 total).
 build_numa_bind_args() {
   local tp="$1"
   NUMA_BIND_ARGS=()
   if [[ "$NUMA_BIND" -ne 1 ]]; then
     return 0
   fi
-  if [[ "$tp" -ne 4 ]]; then
-    die "--numa-bind currently supports TP=4 only (got TP=${tp})"
-  fi
-  NUMA_BIND_ARGS=(
-    --numa-bind
-    --numa-bind-nodes 0 0 0 0
-    --numa-bind-cpus 0-25 26-51 52-77 78-103
-  )
-  echo "# numa-bind TP=4: nodes=0 0 0 0  cpus=0-25 26-51 52-77 78-103"
+  case "$tp" in
+    4)
+      # GPUs 0-3 all on NUMA 0.
+      NUMA_BIND_ARGS=(
+        --numa-bind
+        --numa-bind-nodes 0 0 0 0
+        --numa-bind-cpus
+          0-12,104-116
+          13-25,117-129
+          26-38,130-142
+          39-51,143-155
+      )
+      echo "# numa-bind TP=4: nodes=0 0 0 0"
+      echo "#   cpus=0-12,104-116 13-25,117-129 26-38,130-142 39-51,143-155"
+      ;;
+    8)
+      # GPUs 0-3 → NUMA 0; GPUs 4-7 → NUMA 1.
+      NUMA_BIND_ARGS=(
+        --numa-bind
+        --numa-bind-nodes 0 0 0 0 1 1 1 1
+        --numa-bind-cpus
+          0-12,104-116
+          13-25,117-129
+          26-38,130-142
+          39-51,143-155
+          52-64,156-168
+          65-77,169-181
+          78-90,182-194
+          91-103,195-207
+      )
+      echo "# numa-bind TP=8: nodes=0 0 0 0 1 1 1 1"
+      echo "#   cpus=0-12,104-116 ... 39-51,143-155 | 52-64,156-168 ... 91-103,195-207"
+      ;;
+    *)
+      die "--numa-bind currently supports TP=4 or TP=8 only (got TP=${tp})"
+      ;;
+  esac
 }
 
 reject_sample_json_fields() {
