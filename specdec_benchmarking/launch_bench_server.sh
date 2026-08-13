@@ -81,6 +81,8 @@ NSYS_RUN_TS=""
 # PV*S* Disagg-DFlash: one nsys profile over a parent that starts draft+verify
 # → single combined .nsys-rep (nsys start/launch multi-process is flaky on 2025.1).
 NSYS_COMBINED_OUT=""
+# Pass vLLM --numa-bind with fixed TP=4 CPU pin map (cpus 0-103 → 4 equal groups).
+NUMA_BIND=0
 
 # Synthetic acceptance rates used in prior PD*S* sweeps.
 SYNTH_RATES='[0.9184485330681254,0.8179331856606844,0.7422584874101532,0.6783825324352425,0.6191175805795398,0.5591293341169025,0.49742326296279554]'
@@ -152,6 +154,11 @@ Options:
                            Use for curl quality checks on PV*S* / PD*S*.
   --enable-disagg-profile  Opt-in SD timing + Disagg/DFlash profile logs
                            (CUDA sync — skews latency; off by default for benches)
+  --numa-bind              TP=4 only: add vLLM --numa-bind with
+                           --numa-bind-nodes 0 0 0 0 and --numa-bind-cpus
+                           splitting host CPUs 0-103 into 4 equal groups
+                           (0-25 26-51 52-77 78-103). Applied to each vllm
+                           serve whose tensor-parallel-size is 4.
   --proxy                  Also launch toy_proxy_server.py on --proxy-port
   --proxy-port PORT        Client-facing proxy port (default 8000)
   --proxy-script PATH      Override path to toy_proxy_server.py
@@ -329,6 +336,26 @@ count_csv() {
   local s="$1"
   if [[ -z "$s" ]]; then echo 0; return; fi
   awk -F, '{print NF}' <<<"$s"
+}
+
+# Sets NUMA_BIND_ARGS for a vllm serve with the given TP. Empty if --numa-bind
+# was not requested. Currently TP=4 only: all ranks on NUMA node 0, CPUs 0-103
+# split into four equal ranges.
+build_numa_bind_args() {
+  local tp="$1"
+  NUMA_BIND_ARGS=()
+  if [[ "$NUMA_BIND" -ne 1 ]]; then
+    return 0
+  fi
+  if [[ "$tp" -ne 4 ]]; then
+    die "--numa-bind currently supports TP=4 only (got TP=${tp})"
+  fi
+  NUMA_BIND_ARGS=(
+    --numa-bind
+    --numa-bind-nodes 0 0 0 0
+    --numa-bind-cpus 0-25 26-51 52-77 78-103
+  )
+  echo "# numa-bind TP=4: nodes=0 0 0 0  cpus=0-25 26-51 52-77 78-103"
 }
 
 reject_sample_json_fields() {
@@ -945,6 +972,7 @@ while [[ $# -gt 0 ]]; do
     --no-disagg-async) DISAGG_ASYNC=0; shift ;;
     --no-synthetic) USE_SYNTHETIC=0; shift ;;
     --enable-disagg-profile) ENABLE_DISAGG_PROFILE=1; shift ;;
+    --numa-bind) NUMA_BIND=1; shift ;;
     --nsys) NSYS=1; shift ;;
     --nsys-dir) NSYS_DIR="${2:?}"; NSYS_DIR_SET=1; shift 2 ;;
     --nsys-delay) NSYS_DELAY="${2:?}"; shift 2 ;;
@@ -1104,6 +1132,8 @@ case "$MODE" in
       --tensor-parallel-size "$TP"
       "${COMMON[@]}"
     )
+    build_numa_bind_args "$TP"
+    cmd+=("${NUMA_BIND_ARGS[@]}")
     if [[ "$MODE" == colocated_sd ]]; then
       cmd+=(--speculative-config "$(spec_json "$DRAFT_TP")")
     fi
@@ -1182,6 +1212,8 @@ case "$MODE" in
       --kv-transfer-config "$(kv_json kv_producer)"
       "${COMMON[@]}"
     )
+    build_numa_bind_args "$PREFILL_TP"
+    p_cmd+=("${NUMA_BIND_ARGS[@]}")
     d_cmd=(
       env
       VLLM_USE_V2_MODEL_RUNNER=1
@@ -1195,6 +1227,8 @@ case "$MODE" in
       --kv-transfer-config "$(kv_json kv_consumer)"
       "${COMMON[@]}"
     )
+    build_numa_bind_args "$DECODE_TP"
+    d_cmd+=("${NUMA_BIND_ARGS[@]}")
     if [[ "$MODE" == disagg_sd ]]; then
       d_cmd+=(--speculative-config "$(spec_json "$DRAFT_TP")")
     fi
@@ -1294,6 +1328,8 @@ case "$MODE" in
       --speculative-config "$(spec_json_sd_disagg)"
       "${COMMON[@]}"
     )
+    build_numa_bind_args "$VERIFY_TP"
+    verify_cmd+=("${NUMA_BIND_ARGS[@]}")
     if [[ "$ENABLE_DISAGG_PROFILE" -eq 1 ]]; then
       draft_cmd+=(--enable-sd-timing-model --enable-dflash-draft-profile)
       verify_cmd+=(--enable-sd-timing-model --enable-disagg-dflash-profile)
