@@ -58,6 +58,7 @@ from vllm.multimodal.video import (
     VIDEO_LOADER_REGISTRY,
 )
 from vllm.platforms import current_platform
+from vllm.profiler.nvtx import nvtx_range
 from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -1163,7 +1164,19 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
+        # Nested NVTX: outer generic for nsys stats; inner i{N}_… for manual match.
+        vi = int(getattr(self, "_nvtx_execute_step", 0) or 0) + 1
+        self._nvtx_execute_step = vi
+        if hasattr(self.model_runner, "_nvtx_schedule_step"):
+            self.model_runner._nvtx_schedule_step = vi
+        else:
+            setattr(self.model_runner, "_nvtx_schedule_step", vi)
+        spec = getattr(self.model_runner, "speculator", None)
+        if spec is not None:
+            setattr(spec, "last_verify_step", vi)
+        with nvtx_range(
+            f"i{vi}_execute_context", generic="execute_context"
+        ), self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
