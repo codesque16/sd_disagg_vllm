@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import queue
+import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from multiprocessing import Lock
@@ -29,11 +31,26 @@ class AsyncOutputFuture(Future):
         self.single_value = single_value
         super().__init__()
 
-    def result(self, timeout=None):
-        if timeout is not None:
-            raise RuntimeError("timeout not implemented")
+    def _copy_event(self) -> torch.cuda.Event | None:
+        # AsyncOutput / AsyncPoolingOutput use copy_event; V1 GPU runner
+        # wrappers use async_copy_ready_event.
+        return getattr(self.async_output, "copy_event", None) or getattr(
+            self.async_output, "async_copy_ready_event", None
+        )
 
+    def result(self, timeout=None):
         if not super().done():
+            if timeout is not None:
+                event = self._copy_event()
+                if event is None:
+                    raise RuntimeError("timeout not implemented")
+                # Soft wait for DtoH readiness without a full synchronize.
+                # Used by draft-blocked launch-before-sync (short timeout).
+                deadline = time.monotonic() + timeout
+                while not event.query():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError()
+                    time.sleep(0)
             try:
                 output = self.async_output.get_output()
                 self.set_result(output if self.single_value else [output])
@@ -46,6 +63,13 @@ class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
+        self._async_draft_side_queue: queue.Queue | None = None
+        spec_cfg = self.vllm_config.speculative_config
+        if (
+            spec_cfg is not None
+            and getattr(spec_cfg, "disagg_dflash_async_verify", False)
+        ):
+            self._async_draft_side_queue = queue.Queue(maxsize=64)
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(
             vllm_config=self.vllm_config,
@@ -67,6 +91,10 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+        if self._async_draft_side_queue is not None:
+            inner = getattr(self.driver_worker, "worker", None)
+            if inner is not None and hasattr(inner, "set_async_draft_side_queue"):
+                inner.set_async_draft_side_queue(self._async_draft_side_queue)
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""
@@ -132,6 +160,23 @@ class UniProcExecutor(Executor):
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.collective_rpc("take_draft_token_ids", single_value=True)
+
+    def poll_async_remote_drafts(self) -> DraftTokenIds | None:
+        return self.collective_rpc("poll_async_remote_drafts", single_value=True)
+
+    def try_recv_async_remote_drafts(self) -> DraftTokenIds | None:
+        q = self._async_draft_side_queue
+        if q is None:
+            return None
+        try:
+            req_ids, draft_ids = q.get_nowait()
+        except Exception:
+            return None
+        return DraftTokenIds(req_ids, draft_ids)
+
+    @property
+    def has_async_draft_side_channel(self) -> bool:
+        return self._async_draft_side_queue is not None
 
     def check_health(self) -> None:
         # UniProcExecutor will always be healthy as long as
